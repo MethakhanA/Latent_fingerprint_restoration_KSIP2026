@@ -146,7 +146,7 @@ class BlockBaseFrameWork:
         
         spa_map_img = np.zeros((o_blocksize * rows_len, o_blocksize * cols_len), np.float32)
         
-        for row_index in tqdm(range(rows_len)):
+        for row_index in (range(rows_len)):
             start_o_row = self.row_o_block_index_list[row_index]
             stop_o_row = start_o_row + o_blocksize
             
@@ -180,7 +180,7 @@ class BlockBaseFrameWork:
         if self.__zeromean:
             mean_arr = np.zeros((rows_len, cols_len))
             
-        for row_index in tqdm(range(rows_len)):
+        for row_index in (range(rows_len)):
             start_o_row = self.row_o_block_index_list[row_index]
             stop_o_row = start_o_row + o_blocksize
             

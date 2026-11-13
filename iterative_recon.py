@@ -1,13 +1,6 @@
 import os
 from glob import glob
 
-'''
-# ---- First, let us clarify the steps to preparation
-
-# --
-First we find the crossing point, find all the block that line crossed
-then, we train the data from outer->inner
-'''
 import math
 import cv2 as cv
 from tqdm import tqdm
@@ -17,7 +10,11 @@ import matplotlib as mpl
 from matplotlib.animation import FuncAnimation
 import copy
 
+from skimage.morphology import convex_hull_image
 
+from framework.blockattribute import BlockAttribute
+
+from cluster_growth import grow_reconstruct_crossing_iterative
 
 def project_line_supercover(p0: tuple[float, float], p1: tuple[float, float], shape: tuple[int, int] = None) -> list[tuple[int, int]]:
     """
@@ -79,6 +76,7 @@ def project_line_supercover(p0: tuple[float, float], p1: tuple[float, float], sh
             curr_y += step_y
 
     return blocks
+
 def get_crossing_trajectories(crossings_output: list, shape: tuple[int, int] = None) -> list[dict]:
     """
     Projects rays from source block cell centers (sy + 0.5, sx + 0.5) 
@@ -107,6 +105,7 @@ def get_crossing_trajectories(crossings_output: list, shape: tuple[int, int] = N
         })
 
     return results
+
 def visualize_crossing_blocks(shape: tuple[int, int], 
                               trajectories_data: list[dict], 
                               background_image=None, 
@@ -221,7 +220,7 @@ def check_8_con(pos_list, ks_map):
             filter_pos_list.append(pos)
     return filter_pos_list
 
-def angle_diff(a: float, b: float) -> float:
+
     """
     Computes the shortest unoriented angle difference between two angles in radians.
     
@@ -288,6 +287,7 @@ def visualize_3x3_orientation(orientations, row_map_index, col_map_index, magnit
     plt.axis('off')
     plt.tight_layout()
     plt.show()
+
 def distance_p2p(pos1, pos2):
     y1, x1 = pos1
     y2, x2 = pos2
@@ -295,6 +295,7 @@ def distance_p2p(pos1, pos2):
     d_x = np.abs(x1-x2)
     d_r = np.sqrt(d_y**2+d_x**2)
     return d_r
+
 def peak_2_peak_min_distance(couple_peak_pos:tuple, couple_peak_comp_pos:tuple):
     pos, inv_pos = couple_peak_pos
     comp_pos, comp_inv_pos = couple_peak_comp_pos
@@ -479,137 +480,119 @@ def mask_block_magnitude(patch_magnitude, double_peak_positions, thresh=0.8):
     combined_mask = np.clip(np.sum(clusters, axis=0), 0, 1).astype(np.float32)
     return patch_magnitude * combined_mask
 
-
-def grow_reconstruct_crossing_iterative(BBF, crossing, attribute_map, ks_map, 
-                                      min_kurtosis=0.5, max_steps=8, mask_thresh=0.8):
+def mask_block_magnitude_watershed(patch_magnitude, double_peak_positions, thresh=0.8):
     """
-    Cluster growth using Method 2 (Distance-Based Peak Selection).
-    Selects peaks by comparing against the parent block's chosen peak.
+    Applies marker-based watershed segmentation for symmetric double peaks 
+    using the updated BlockAttribute class, and returns the masked frequency patch.
     """
-    o_blocksize = BBF._BlockBaseFrameWork__overlap_blocksize
-    H, W = ks_map.shape
+    # 1. Instantiate the BlockAttribute with the current frequency patch
+    BA = BlockAttribute(patch_magnitude)
     
-    initial_crossing_pt = crossing[0]
-    initial_sources = list(crossing[1:])
+    # 2. Manually inject the tracked peak pair to act as the watershed markers.
+    # This forces the watershed algorithm to only grow from the selected trajectory.
+    pos, inv_pos = double_peak_positions
+    BA.couple_peak = [{"position": (pos, inv_pos)}]
     
-    current_cluster = set(initial_sources)
-    centroid_history = [initial_crossing_pt]
+    # 3. Run the new watershed segmentation
+    binary_mask, labeled_clusters, paired_masks = BA.segment_peaks_watershed()
     
-    # Dictionary to store the specific peak dict chosen for each block in the cluster
-    # Format: {(r, c): peak_dict}
-    selected_peaks = {}
+    # 4. Fallback if the segmentation fails or returns empty
+    if binary_mask is None or np.count_nonzero(binary_mask) == 0:
+        return patch_magnitude
+        
+    # 5. Convert the 255-based uint8 mask to a 0.0-1.0 float32 multiplier
+    combined_mask = (binary_mask > 0).astype(np.float32)
     
-    # Initialize the source blocks (they act as the ultimate parents)
-    for (r, c) in initial_sources:
-        if attribute_map[r, c] is not None:
-            # For the initial seeds, we trust their strongest peak
-            selected_peaks[(r, c)] = attribute_map[r, c][0]
-    
-    working_freq_map = BBF.getMagnitude().copy()
-    
-    # Initial snapshot before modifying frequencies
-    reconstructed_img = run_safe_istft(BBF, working_freq_map)
-    history = [{
-        'step': 0,
-        'cluster': list(current_cluster),
-        'centroid': initial_crossing_pt,
-        'new_blocks': list(current_cluster),
-        'reconstructed_img': reconstructed_img
-    }]
-    
-    l_8_neighbors = [(-1, -1), (-1, 0), (-1, 1), 
-                     (0, -1),           (0, 1), 
-                     (1, -1),  (1, 0),  (1, 1)]
-    
-    # Apply initial masks for the seed blocks
-    for (r, c) in initial_sources:
-        if (r, c) in selected_peaks:
-            r_start, c_start = BBF.row_map_block_index_list[r], BBF.col_map_block_index_list[c]
-            patch = working_freq_map[r_start:r_start + o_blocksize, c_start:c_start + o_blocksize]
-            pos_p, inv_pos_p = selected_peaks[(r, c)]["position"]
-            working_freq_map[r_start:r_start + o_blocksize, c_start:c_start + o_blocksize] = \
-                mask_block_magnitude(patch, [pos_p, inv_pos_p], thresh=mask_thresh)
+    return patch_magnitude * combined_mask
 
-    # ---------------- Iterative Growth ----------------
-    for step in range(1, max_steps + 1):
-        new_candidates = set()
-        newly_masked_blocks = []
+def convert_to_triangular_mask(mask, ori):
+    """
+    Converts a single isolated pair mask into bounded triangular sectors (wedges) that:
+    1. Match the max angular spread of the original peak.
+    2. Terminate at the maximum radial distance (frequency) of the original pair.
+    
+    Args:
+        mask (np.ndarray): 2D binary mask.
+        ori (float): Orientation angle of the mask in degrees.
         
-        # 1. Search neighbors and apply METHOD 2
-        for (r, c) in list(current_cluster):
-            if (r, c) not in selected_peaks:
-                continue
-                
-            parent_peak_pos = selected_peaks[(r, c)]["position"]
-            
-            for dr, dc in l_8_neighbors:
-                nr, nc = r + dr, c + dc
-                
-                # Check bounds, kurtosis, cluster membership, and attribute_map validity
-                if (0 <= nr < H and 0 <= nc < W and 
-                    (nr, nc) not in current_cluster and 
-                    (nr, nc) not in new_candidates and 
-                    ks_map[nr, nc] >= min_kurtosis and 
-                    attribute_map[nr, nc] is not None):
-                    
-                    # --- METHOD 2: Distance-Based Peak Modification ---
-                    best_peak = None
-                    min_dist = float('inf')
-                    
-                    for candidate_peak in attribute_map[nr, nc]:
-                        cand_pos = candidate_peak["position"]
-                        # Compare candidate peak to the parent's chosen peak
-                        dist = peak_2_peak_min_distance(cand_pos, parent_peak_pos)
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_peak = candidate_peak
-                            
-                    if best_peak is not None:
-                        selected_peaks[(nr, nc)] = best_peak
-                        new_candidates.add((nr, nc))
-                        newly_masked_blocks.append((nr, nc))
-                        
-        if not new_candidates:
-            break
-            
-        current_cluster.update(new_candidates)
-        
-        # 2. Mask frequencies for the NEW blocks only
-        for (nr, nc) in newly_masked_blocks:
-            r_start = BBF.row_map_block_index_list[nr]
-            c_start = BBF.col_map_block_index_list[nc]
-            
-            patch = working_freq_map[r_start:r_start + o_blocksize, c_start:c_start + o_blocksize]
-            pos_p, inv_pos_p = selected_peaks[(nr, nc)]["position"]
-            
-            masked_patch = mask_block_magnitude(patch, [pos_p, inv_pos_p], thresh=mask_thresh)
-            working_freq_map[r_start:r_start + o_blocksize, c_start:c_start + o_blocksize] = masked_patch
+    Returns:
+        np.ndarray: The new triangular mask.
+    """
+    if mask is None or not np.any(mask):
+        return mask
 
-        # 3. Reconstruct image
-        reconstructed_img = run_safe_istft(BBF, working_freq_map)
-        
-        # 4. Compute New Centroid using dynamically chosen angles
-        valid_blocks = list(current_cluster)
-        candidate_angles = [selected_peaks[b]["angle"] for b in valid_blocks if b in selected_peaks]
-        active_blocks = [b for b in valid_blocks if b in selected_peaks]
-        
-        if len(active_blocks) >= 2:
-            new_crossing_pt = find_crossing_point(active_blocks, candidate_angles)
-            current_centroid = new_crossing_pt if new_crossing_pt is not None else centroid_history[-1]
-        else:
-            current_centroid = centroid_history[-1]
-            
-        centroid_history.append(current_centroid)
-        
-        history.append({
-            'step': step,
-            'cluster': valid_blocks,
-            'centroid': current_centroid,
-            'new_blocks': list(new_candidates),
-            'reconstructed_img': reconstructed_img
-        })
-        
-    return history
+    h, w = mask.shape
+    cy, cx = h // 2, w // 2
+    
+    # Find coordinates of the original pair mask pixels
+    Y, X = np.where(mask > 0)
+    
+    # Exclude center pixel to avoid division by zero
+    valid = (Y != cy) | (X != cx)
+    Y_valid, X_valid = Y[valid], X[valid]
+    
+    if len(Y_valid) == 0:
+        return mask.copy()
+    
+    # 1. Compute maximum angular spread (theta width)
+    theta_mask = np.degrees(np.arctan2(Y_valid - cy, X_valid - cx))
+    diff = np.abs(theta_mask - ori) % 180.0
+    diff = np.minimum(diff, 180.0 - diff)
+    max_width = np.max(diff)
+    max_width = max(max_width, 1.5)  # Enforce minimum angular width
+    
+    # 2. Compute maximum frequency radius (r max)
+    radial_distances = np.hypot(Y_valid - cy, X_valid - cx)
+    r_max = np.max(radial_distances)
+    
+    # 3. Create polar grid for the entire block
+    YY, XX = np.indices((h, w))
+    dy, dx = YY - cy, XX - cx
+    grid_r = np.hypot(dy, dx)
+    grid_theta = np.degrees(np.arctan2(dy, dx))
+    
+    # Calculate angular difference on grid
+    diff_grid = np.abs(grid_theta - ori) % 180.0
+    diff_grid = np.minimum(diff_grid, 180.0 - diff_grid)
+    
+    # 4. Combine angular condition AND radial cap condition
+    angle_condition = (diff_grid <= max_width)
+    radius_condition = (grid_r <= r_max)
+    
+    new_mask = (angle_condition & radius_condition).astype(mask.dtype)
+    
+    # Keep DC component active
+    new_mask[cy, cx] = 1
+    
+    return new_mask
+
+# def mask_block_magnitude_triangle(patch_magnitude, double_peak_positions, thresh=0.8):
+#     """
+#     Applies marker-based watershed segmentation for symmetric double peaks 
+#     using the updated BlockAttribute class, and returns the masked frequency patch.
+#     """
+#     # 1. Instantiate the BlockAttribute with the current frequency patch
+#     BA = BlockAttribute(patch_magnitude)
+    
+#     # 2. Manually inject the tracked peak pair to act as the watershed markers.
+#     # This forces the watershed algorithm to only grow from the selected trajectory.
+#     pos, inv_pos = double_peak_positions
+#     BA.couple_peak = [{"position": (pos, inv_pos)}]
+    
+#     # 3. Run the new watershed segmentation
+#     binary_mask, labeled_clusters, paired_masks = BA.segment_peaks_watershed()
+    
+#     # 4. Fallback if the segmentation fails or returns empty
+#     if binary_mask is None or np.count_nonzero(binary_mask) == 0:
+#         return patch_magnitude
+
+#     binary_mask = convert_to_triangular_mask()
+    
+#     # 5. Convert the 255-based uint8 mask to a 0.0-1.0 float32 multiplier
+#     combined_mask = (binary_mask > 0).astype(np.float32)
+    
+#     return patch_magnitude * combined_mask
+
 
 def run_safe_istft(BBF, freq_map):
     bbf_copy = copy.deepcopy(BBF)
@@ -715,7 +698,33 @@ def animate_reconstruction_and_growth(ori_array, history, crossing_idx, backgrou
     plt.show()
     return anim
 
+def fft_peak_mean_var(magnitude_block, lpf_radius=15, hpf_radius=3):
+    filter = FreqFilter(magnitude_block.shape)
+    LPF = filter.getLPF(15, f_type="Ideal")
+    HPF = filter.getHPF(3, f_type="Ideal")
+    banded = magnitude_block * LPF * HPF
 
+    values = banded[banded != 0]
+    if len(values)<4:
+        return 0
+    Q = np.var(values)*np.max(values)/np.mean(values)
+    return Q
+
+def generate_pmv_mask(pmv_map, limit_ratio=0.1):
+    """
+    Generates a binary mask from the PMV map using a hard limit threshold 
+    and applies a convex hull to the result.
+    """
+    hard_limit_thresh = limit_ratio * np.max(pmv_map)
+    base_mask = (pmv_map >= hard_limit_thresh)
+    
+    if np.any(base_mask):
+        hard_limit_mask = convex_hull_image(base_mask)
+    else:
+        # Fallback if the map is entirely blank/zeros
+        hard_limit_mask = np.zeros_like(base_mask, dtype=bool)
+        
+    return hard_limit_mask
 
 if __name__ == "__main__":
     
@@ -732,26 +741,29 @@ if __name__ == "__main__":
 
     from framework.grouping_framework import map_clustering_peak_threshold
 
-    from framework.utils.plot_all import plot_all
+    # from framework.utils.plot_all import plot_all
     from framework.utils.freqfilter import FreqFilter
     from framework.utils.kurtosis import fft_kurtosis
     from framework.utils.plot_all import plot_all
-    # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\U_roll_500"
-    out_path = r"C:\work\image_processing\latent_fingerprint\model\data\data_tv"
-    # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\tb"
-    
-    # out_path = r""
-    # out_path = r"D:\work\image_processing\Latent_fingerprint\segment\data\data_b"
+    from framework.utils.normalize_range import normalize_image
+
     # ---- Define Params ----
     o_block_size = 64
     no_block_size = 16
     bp_r = (3, 16)
     gss_f_size = 3
     # ---- ---- ----
-    for file in tqdm(glob(os.path.join(out_path, '*'))):
 
-        # file = r"D:\work\image_processing\Latent_fingerprint\segment\data\data_tv\Good_Quality.png"
-        # file = r"C:\work\image_processing\latent_fingerprint\model\data\U_roll\00002302_U_500_roll_01.png"
+    # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
+    # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
+    out_path = r"C:\work\image_processing\latent_fingerprint\model\data\data_tv"
+    save_dir = r"C:\work\image_processing\latent_fingerprint\model\data\output"
+    for file in tqdm(glob(os.path.join(out_path, '*'))):
+        # file = r"C:\work\image_processing\latent_fingerprint\model\data\data_tv\overlap_rim.png"
+        # if os.path.exists(os.path.join(save_dir, os.path.basename(file))):
+        #     continue
+
+
         img = cv.imread(file, 0) # This is a Texture TV image.
         img = cv.bitwise_not(img)
         # ---- Run BlockBase PipeLine ----
@@ -766,14 +778,15 @@ if __name__ == "__main__":
         # ---- ---- ----
         
         # ---- Apply Gaussian Bandpass ----
+        # Between frequency 3-15
         magnitude = BBF.apply_func_map(magnitude, ban_bandpass_gaussian, bp_r[0], bp_r[1], gss_f_size)
-        # plot_all(magnitude[row_map_index[index]:row_map_index[index]+o_block_size, col_map_index[index]:col_map_index[index]+o_block_size], cmap='hot', title_list=["Gaussian Bandpass Magnitude"])
         
-        # ---- Create kurtosis map ----
-        ks_map = np.zeros((len(row_map_index), len(col_map_index)))
-        ks_map = BBF.apply_func_map(magnitude, fft_kurtosis, output_is_img=False, output_vector=ks_map)
-        # ---- ---- ----
-        
+        # ---- Create PMV map
+        pmv_map = np.zeros((len(row_map_index), len(col_map_index)))
+        pmv_map = BBF.apply_func_map(magnitude, fft_peak_mean_var, output_is_img=False, output_vector=pmv_map)
+        pmv_map = normalize_image(pmv_map)
+        pmv_mask = generate_pmv_mask(pmv_map, limit_ratio=0.1)
+
         # ---- Crop Kurtosis and picture for better Visualization ----
         block_pad = np.array(BBF.fp_pad)//no_block_size
         # ks_map = ks_map[block_pad[0]:-block_pad[1], block_pad[2]:-block_pad[3]]
@@ -788,32 +801,39 @@ if __name__ == "__main__":
         # # ---- ---- ----
         
         # /// C2: ---- Create Activation map from localmultipeak and banningpeak
-        max_pos_list = local_multipeak(ks_map, mean_radius_ban=None, radius_ban=2, max_peak_count=np.inf)
+        max_pos_list = local_multipeak(pmv_map, mean_radius_ban=None, radius_ban=2, max_peak_count=np.inf)
         # max_pos_list = banning_peak(ks_map, mean_radius_ban=None)
         # -- Check if 8 connectivity have 0 kurtosis
-        max_pos_list = check_8_con(max_pos_list, ks_map)
+        max_pos_list = check_8_con(max_pos_list, pmv_map)
         row_mp_list, col_mp_list = [item[0] for item in max_pos_list], [item[1] for item in max_pos_list]
         mp_grp = BlockGroup(row_mp_list, col_mp_list)
         # ---- ---- ----
         
         # ---- Create Activation Map
-        activation_map = mp_grp.generate_activation_map(ks_map.shape[0], ks_map.shape[1])
-        activation_map = exclude_boundary(activation_map)        
-        plot_all([pad_img, ks_map, activation_map], cmap=['gray', 'hot', 'gray'])
-
+        activation_map = mp_grp.generate_activation_map(pmv_map.shape[0], pmv_map.shape[1])
+        activation_map = exclude_boundary(activation_map)
+        activation_map = activation_map*pmv_mask        
+        plot_all([pad_img, pmv_map, activation_map], cmap=['gray', 'hot', 'gray'], title_list=["Original", "PMV Map", "Starting Peak Pos"])
+        
         # ---- Create Attribute map ----
         orientation_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.ndarray)
         orientation_map = BBF.apply_func_map(magnitude, find_orientation, output_is_img=False, output_vector=orientation_map)
         # ---- ---- ----
         o_map = orientation_map
-        # o_map = orientation_map[block_pad[0]:-block_pad[1], block_pad[2]:-block_pad[3]]
-        # magnitude = magnitude[block_pad[0]*64:-block_pad[1]*64, block_pad[2]*64:-block_pad[3]*64]
-        # print(o_map.shape, activation_map.shape)
         # ---- ---- ----
 
         
         # # 1. Run your original function (unmodified)
-        crossings = find_orientation_crossings(o_map, d=2.0, dist_tol=1.5, cluster_tol=3.0, min_lines=2, max_crossings=100, inside_image_only=True, activation_map=activation_map)
+        raw_crossings = find_orientation_crossings(o_map, d=2.0, dist_tol=1.5, cluster_tol=3.0, min_lines=2, max_crossings=100, inside_image_only=True, activation_map=activation_map)
+        crossings = []
+        for crossing in raw_crossings:
+            cy, cx = crossing[0] # Continuous float coordinates
+            icy, icx = int(round(cy)), int(round(cx))
+            if 0 <= icy < pmv_mask.shape[0] and 0 <= icx < pmv_mask.shape[1]:
+                if pmv_mask[icy, icx]: # Only keep if inside mask
+                    crossings.append(crossing)
+
+
         visualize_crossings(o_map, crossings, background_image=pad_img, cmap='gray')
         
         # r_idx, c_idx = 14, 14
@@ -829,30 +849,33 @@ if __name__ == "__main__":
         # plot_all([pad_img[p_row:p_row+16, p_col:p_col+16], magnitude[m_row:m_row+64, m_col:m_col+64]])
         # ---- ---- ----
         
-        # ----
+        # ---- CreateOrientation Tensor Map
         attribute_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.ndarray)
         attribute_map = BBF.apply_func_map(magnitude, find_orientation_support_v, output_is_img=False, output_vector=attribute_map)
+        # ---- ---- ----
 
-        all_centroids = []
 
-        MIN_KURTOSIS_THRESHOLD = 0.5  # Adjust based on your ks_map distribution
-        MAX_GROWTH_STEPS = 6
 
+        
+        best_reconstruction = None
+        max_cluster_size = 0
         animations = []
-
         for crossing_idx, crossing in enumerate(crossings):
-            # 1. Grow cluster, apply frequency peak mask, and compute iSTFT frame-by-frame
+            # Grow cluster
             growth_history = grow_reconstruct_crossing_iterative(
                 BBF=BBF,
                 crossing=crossing,
                 attribute_map=attribute_map,
-                ks_map=ks_map,
+                ks_map=pmv_map,
+                pmv_mask=pmv_mask,
                 min_kurtosis=0.5,
-                max_steps=6,
-                mask_thresh=0.7
+                max_steps=30,
+                mask_thresh=0.7,
+                mask_func=mask_block_magnitude, 
+                istft_func=run_safe_istft
             )
             
-            # 2. Render side-by-side animation window
+            # 2. Render animation
             anim = animate_reconstruction_and_growth(
                 ori_array=o_map,
                 history=growth_history,
@@ -862,6 +885,84 @@ if __name__ == "__main__":
                 block_size=no_block_size,
                 offset=24
             )
-            animations.append(anim)
+            
+            # 3. Save as GIF
+            gif_filename = os.path.join("", f"{os.path.basename(file)}_crossing_{crossing_idx}.gif")
+            
+            print(f"Saving animation for crossing {crossing_idx}...")
+            # fps controls the speed (frames per second). Lower is slower.
+            anim.save(gif_filename, writer='pillow', fps=2) 
+            print(f"Saved: {gif_filename}")
 
-        plt.show()
+        # # ---- Save the best reconstruction to a directory ----
+        # if best_reconstruction is not None:
+        #     # Define output directory (e.g., alongside data_tv)
+        #     # save_dir = os.path.join(os.path.dirname(out_path), "reconstructed_outputs")
+        #     # os.makedirs(save_dir, exist_ok=True)
+            
+        #     # Normalize the iSTFT output to 0-255 uint8 for saving
+        #     output_img_normalized = cv.normalize(best_reconstruction, None, 0, 255, cv.NORM_MINMAX)
+        #     output_img_normalized = output_img_normalized.astype(np.uint8)
+            
+        #     filename = os.path.basename(file)
+        #     # save_path = os.path.join(save_dir, f"recon_{filename}")
+        #     save_path = os.path.join(save_dir, filename)
+            
+        #     cv.imwrite(save_path, output_img_normalized)
+
+
+
+
+
+
+        # all_centroids = []
+
+        # MIN_KURTOSIS_THRESHOLD = 0.5  # Adjust based on your ks_map distribution
+        # MAX_GROWTH_STEPS = 6
+
+        # animations = []
+
+        # for crossing_idx, crossing in enumerate(crossings):
+        #     # 1. Grow cluster, apply frequency peak mask, and compute iSTFT frame-by-frame
+        #     growth_history = grow_reconstruct_crossing_iterative(
+        #         BBF=BBF,
+        #         crossing=crossing,
+        #         attribute_map=attribute_map,
+        #         ks_map=pmv_map,
+        #         pmv_mask=pmv_mask,     # <--- Passed mask here
+        #         min_kurtosis=0.5,
+        #         max_steps=20,
+        #         mask_thresh=0.7,
+        #         # dist_thresh=7.0       # <--- Set distance threshold here
+        #     )
+            
+        #     # 2. Render side-by-side animation window
+        #     anim = animate_reconstruction_and_growth(
+        #         ori_array=o_map,
+        #         history=growth_history,
+        #         crossing_idx=crossing_idx,
+        #         background_image=pad_img,
+        #         cmap='gray',
+        #         block_size=no_block_size,
+        #         offset=24
+        #     )
+        #     animations.append(anim)
+
+        # plt.show()
+        #     # 2. Extract the iteration (state) that yielded the biggest cluster
+        #     best_state = max(growth_history, key=lambda state: len(state['cluster']))
+        #     best_reconstructed_img = best_state['reconstructed_img']
+        #     cluster_size = len(best_state['cluster'])
+            
+        #     # 3. Normalize the iSTFT float32 output into a standard 0-255 image for saving
+        #     norm_img = cv.normalize(best_reconstructed_img, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+            
+        #     # 4. Construct file name and save to disk
+        #     # base_name = os.path.splitext(os.path.basename(file))[0]
+        #     # out_filename = f"{base_name}_crossing_{crossing_idx}_size_{cluster_size}.png"
+        #     out_filename = os.path.basename(file)
+        #     out_filepath = os.path.join(save_dir, out_filename)
+            
+        #     cv.imwrite(out_filepath, norm_img)
+            
+        # print(f"Finished! All best reconstructions saved to: {save_dir}")

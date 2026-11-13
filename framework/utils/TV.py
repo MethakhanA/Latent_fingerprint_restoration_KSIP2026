@@ -14,3 +14,13 @@ def TV_preprocessing(img):
     texture_img = normalize(texture_img).astype(np.uint8)
     return texture_img
     
+if __name__ == "__main__":
+    from glob import glob
+    import os
+    from tqdm import tqdm
+    path = r"C:\work\image_processing\latent_fingerprint\Segmentation\data\input\sd302h_500ppi_original_mate"
+    output_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
+    for file in tqdm(glob(os.path.join(path, '*'))):
+        img = cv.imread(file)
+        out = TV_preprocessing(img)
+        cv.imwrite(os.path.join(output_path, os.path.basename(file)), out)

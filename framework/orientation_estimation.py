@@ -40,7 +40,7 @@ def banning_peak(block_img, radius_ban=3, max_peak_count=5, mean_radius_ban=(3, 
             ban_circular(block_img, x_center[index], y_center[index], radius_ban, (y_indices, x_indices))
     return peak_loc
 
-def local_multipeak(block_img, radius_ban=3, max_peak_count=5, mean_radius_ban=(3, 16)):
+def local_multipeak(block_img, radius_ban=3, max_peak_count=np.inf, mean_radius_ban=(3, 16)):
     if mean_radius_ban is not None:
         block_img = ban_bandpass(block_img, mean_radius_ban[0], mean_radius_ban[1])
     peak_pos = peak_local_max(block_img, radius_ban, num_peaks=max_peak_count, exclude_border=True)

@@ -1,5 +1,8 @@
 import math
 import numpy as np
+from scipy import ndimage as ndi
+from skimage.segmentation import watershed
+import cv2 as cv
 from framework.orientation_estimation import local_multipeak, find_peaks_adaptive_hierarchical
 from framework.utils.check_angle_rad import check_angle_rad
 from framework.utils.plot_all import plot_all
@@ -51,16 +54,17 @@ class BlockAttribute:
         # ---- Declare Variable
         self.block_img = block_img
         self.row, self.col = block_img.shape
-        self.x_center, self.y_center = self.col/2, self.row/2
-        # ---- Initiate function
-        # if peak_pos is None:
-        #     self.find_peak_pos(radius_ban=3)
-        # self.filter_double_peak() # --- Check for double peak
-        # self.find_direction(is_degree=False) # --- Check for direction
-        # self.find_magnitude() # --- Find magnitude
-        # self.find_distance() # --- Find Frequency or Distance
-        # self.find_direction() # --- Find if there is Harmonic
-        # ----
+        self.x_center, self.y_center = self.col / 2.0, self.row / 2.0
+        
+        # Existing attributes
+        self.peak_pos = peak_pos
+        self.couple_peak = None
+        
+        # NEW: Declare watershed attributes here to prevent AttributeError
+        self.segmented_mask = None
+        self.labeled_clusters = None
+        self.paired_masks = []
+        self.orientations = []
 
     def find_peak_pos(self, radius_ban=2, max_peak_count=np.inf):
         # ---- Crop to half image, Local Multipeak, filter doublepeak
@@ -120,7 +124,147 @@ class BlockAttribute:
 
         self.couple_peak = couple_peak
         return couple_peak
+    def segment_peaks_watershed(self, adapt_block_size=31, adapt_c=-5):
+        """
+        Runs marker-based watershed. Assigns the same marker ID to both pos and inv_pos
+        so their resulting segmented clusters are linked.
+        
+        Returns:
+            binary_mask (np.ndarray): Global binary mask of all segmented regions.
+            labeled_clusters (np.ndarray): Integer matrix where each pair shares the same ID.
+            paired_masks (list): List of binary masks, one for each couple_peak pair.
+        """
+        if self.couple_peak is None:
+            self.filter_double_peak()
+            if self.couple_peak is None:
+                return None, None, None
 
+        row, col = self.row, self.col
+
+        # 1. Create a marker array, assigning the SAME ID to both pos and inv_pos of a pair
+        markers = np.zeros((row, col), dtype=np.int32)
+        
+        for idx, pair in enumerate(self.couple_peak, start=1):
+            p1, p2 = pair["position"]
+            
+            # Draw both seeds with the same integer index
+            if 0 <= p1[0] < row and 0 <= p1[1] < col:
+                markers[p1[0], p1[1]] = idx
+            if 0 <= p2[0] < row and 0 <= p2[1] < col:
+                markers[p2[0], p2[1]] = idx
+
+        # 2. Generate an adaptive foreground mask to prevent leaking into noise
+        img_uint8 = cv.normalize(self.block_img, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+        bg_mask = cv.adaptiveThreshold(
+            img_uint8,
+            255,
+            cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv.THRESH_BINARY,
+            blockSize=adapt_block_size,
+            C=adapt_c
+        )
+
+        # 3. Run Watershed on inverted image
+        inverted_img = -self.block_img.astype(np.float32)
+        labeled_clusters = watershed(inverted_img, markers, mask=(bg_mask > 0))
+
+        # 4. Generate combined Global Mask
+        binary_mask = (labeled_clusters > 0).astype(np.uint8) * 255
+
+        # 5. Extract individual bitwise-OR'd binary masks for each pair
+        paired_masks = []
+        for idx in range(1, len(self.couple_peak) + 1):
+            # Because both pos and inv_pos share `idx`, this mask inherently combines them
+            pair_mask = (labeled_clusters == idx).astype(np.uint8) * 255
+            paired_masks.append(pair_mask)
+
+        # Store attributes
+        self.segmented_mask = binary_mask
+        self.labeled_clusters = labeled_clusters
+        self.paired_masks = paired_masks # Save the list of separated pair masks
+
+        return binary_mask, labeled_clusters, paired_masks
+    def filter_small_clusters(self, min_size=10):
+        """
+        Removes clusters that have fewer pixels than min_size.
+        Updates and returns the cleaned binary_mask, labeled_clusters, and paired_masks.
+        """
+        if self.labeled_clusters is None or not self.paired_masks:
+            return None, None, None
+
+        new_labeled_clusters = np.zeros_like(self.labeled_clusters)
+        new_binary_mask = np.zeros_like(self.segmented_mask)
+        new_paired_masks = []
+        valid_couple_peaks = []
+
+        # Iterate through existing masks and couple_peak pairs
+        for idx, pair_mask in enumerate(self.paired_masks):
+            # Count how many pixels are in this cluster (pair_mask values are 255)
+            area = np.count_nonzero(pair_mask)
+
+            if area >= min_size:
+                # Cluster is large enough, keep it
+                new_paired_masks.append(pair_mask)
+                valid_couple_peaks.append(self.couple_peak[idx])
+                
+                # Combine into the new global binary mask
+                new_binary_mask = cv.bitwise_or(new_binary_mask, pair_mask)
+                
+                # Assign a new contiguous ID (1, 2, 3...) to the labeled mask
+                new_label_id = len(new_paired_masks)
+                new_labeled_clusters[pair_mask > 0] = new_label_id
+
+        # Update the class attributes with the filtered data
+        self.couple_peak = valid_couple_peaks
+        self.segmented_mask = new_binary_mask
+        self.labeled_clusters = new_labeled_clusters
+        self.paired_masks = new_paired_masks
+
+        return self.segmented_mask, self.labeled_clusters, self.paired_masks
+    def find_orientation(self):
+        """
+        Finds the orientation (0 to 180 degrees) using the original peak coordinates.
+        Sorts the coordinates to ensure a consistent vector direction.
+        """
+        row, col = self.row, self.col
+        couple_peak = self.couple_peak
+        
+        if couple_peak is None:
+            return None
+            
+        orientations = []
+        
+        for index in range(len(couple_peak)):
+            (pos, inv_pos) = couple_peak[index]["position"]
+            
+            # Correct inverse position for center-aligned peaks
+            if pos[0] == (row // 2):
+                inv_pos = (pos[0], col - pos[1])
+            elif pos[1] == (col // 2):
+                inv_pos = (row - pos[0], pos[1])
+            else:
+                inv_pos = (row - pos[0], col - pos[1])
+                
+            # Sorting ensures p1 has a lower or equal row index compared to p2
+            p1, p2 = sorted([pos, inv_pos])
+            
+            # Differences in image coordinates (row=y, col=x)
+            del_row = p2[0] - p1[0]  # dy >= 0 because of sorting
+            del_col = p2[1] - p1[1]  # dx
+            
+            # Compute base angle in radians
+            angle_rad = math.atan2(del_row, del_col)
+            
+            # Convert to degrees and strictly bound between 0 and 180
+            angle_deg = math.degrees(angle_rad) % 180.0
+            
+            couple_peak[index]["orientation"] = angle_deg
+            orientations.append(angle_deg)
+            
+        self.couple_peak = couple_peak
+        self.orientations = orientations
+        
+        return orientations
     
     """def find_peak_pos(self, radius_ban=2, max_peak_count=np.inf):
         # ---- Find peak position from local multipeak. (Better than banning peak)
