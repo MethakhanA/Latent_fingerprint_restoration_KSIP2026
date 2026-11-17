@@ -56,6 +56,12 @@ class BlockBaseFrameWork:
             overlap_block_size (int): The big block size (e.g., 64)
             nonoverlap_block_size (int): The small block size (e.g., 32)
         """
+        # 17/11/26 Just AI value Error prevention
+        if self.__img is None or self.__img.ndim != 2:
+            raise ValueError("Input image must be a 2D grayscale numpy array.")
+        if overlap_block_size < nonoverlap_block_size or (overlap_block_size - nonoverlap_block_size) % 2 != 0:
+            raise ValueError("overlap_block_size must be >= nonoverlap_block_size with an even difference.")
+
         img = self.__img
         
         self.__nonoverlap_blocksize = nonoverlap_block_size
@@ -79,9 +85,9 @@ class BlockBaseFrameWork:
         # blur mask
         if self.__blur_edge:
             blur_size, erode_size = self.__blur_edge_size
-            blur_mask = np.ones_like(img)*255
+            blur_mask = np.ones_like(img, dtype=np.uint8) * 255 # 17/11/26. Only change dtype=np.uint8
             blur_mask = np.pad(
-                img,
+                blur_mask,
                 ((pad_top, pad_bottom), (pad_left, pad_right)),
                 "constant",
                 constant_values=0,
@@ -101,17 +107,20 @@ class BlockBaseFrameWork:
         no_blocksize = self.__nonoverlap_blocksize
         
         start_index = (o_blocksize - no_blocksize) // 2
-        stop_index_row = self.__img.shape[0] - (o_blocksize - (start_index + no_blocksize))
+        stop_index_row = self.__img.shape[0] - start_index
+        stop_index_col = self.__img.shape[1] - start_index
         
         # ROW indices
         self.row_no_block_index_list = range(start_index, stop_index_row, no_blocksize)
-        self.row_o_block_index_list = range(0, int(o_blocksize * (stop_index_row - start_index) / no_blocksize), no_blocksize)
-        self.row_map_block_index_list = range(0, len(self.row_no_block_index_list) * o_blocksize, o_blocksize)
+        n_rows = len(self.row_no_block_index_list)
+        self.row_o_block_index_list = range(0, n_rows * no_blocksize, no_blocksize)
+        self.row_map_block_index_list = range(0, n_rows * o_blocksize, o_blocksize)
         
-        # COL indices (Note: relies on stop_index_row for square processing based on original logic)
-        self.col_no_block_index_list = range(start_index, stop_index_row, no_blocksize)
-        self.col_o_block_index_list = range(0, int(o_blocksize * (stop_index_row - start_index) / no_blocksize), no_blocksize)
-        self.col_map_block_index_list = range(0, len(self.col_no_block_index_list) * o_blocksize, o_blocksize)
+        # COL indices
+        self.col_no_block_index_list = range(start_index, stop_index_col, no_blocksize)
+        n_cols = len(self.col_no_block_index_list)
+        self.col_o_block_index_list = range(0, n_cols * no_blocksize, no_blocksize)
+        self.col_map_block_index_list = range(0, n_cols * o_blocksize, o_blocksize)
    
     def __crop_map(self, map_img):
         o_blocksize = self.__overlap_blocksize
@@ -127,13 +136,14 @@ class BlockBaseFrameWork:
             stop_map_row = start_map_row + o_blocksize
             
             for col_index in range(len(self.col_no_block_index_list)):
-                start_no_col = self.col_o_block_index_list[col_index]
+                start_no_col = self.col_no_block_index_list[col_index]
                 stop_no_col = start_no_col + no_blocksize
                 
                 start_map_col = self.col_map_block_index_list[col_index]
                 stop_map_col = start_map_col + o_blocksize
                 
                 patch = map_img[start_map_row:stop_map_row, start_map_col:stop_map_col]
+                patch = self.__crop_center(patch, no_blocksize)
                 crop_img[start_no_row:stop_no_row, start_no_col:stop_no_col] = patch
                 
         return crop_img
@@ -211,30 +221,28 @@ class BlockBaseFrameWork:
             self.__mean_arr = mean_arr
   
     def istft(self):
-        """Invert STFT. Needs testing on real picture."""
+        if self.__freq_map_img is None or self.__phase_map_img is None:
+            raise RuntimeError("stft() must be called before istft().")
+
         o_blocksize = self.__overlap_blocksize
         no_blocksize = self.__nonoverlap_blocksize
-        
         output_img = np.zeros_like(self.__img, np.float32)
         
         for row_index in range(len(self.row_no_block_index_list)):
             start_no_row = self.row_no_block_index_list[row_index]
             stop_no_row = start_no_row + no_blocksize
-            
             start_map_row = self.row_map_block_index_list[row_index]
             stop_map_row = start_map_row + o_blocksize
             
             for col_index in range(len(self.col_no_block_index_list)):
                 start_no_col = self.col_no_block_index_list[col_index]
                 stop_no_col = start_no_col + no_blocksize
-                
                 start_map_col = self.col_map_block_index_list[col_index]
                 stop_map_col = start_map_col + o_blocksize
                 
                 f_patch = self.__freq_map_img[start_map_row:stop_map_row, start_map_col:stop_map_col]
                 ph_patch = self.__phase_map_img[start_map_row:stop_map_row, start_map_col:stop_map_col]
 
-                
                 FFT = Fourier2D(f_patch, frequency=True, window_func=self.__window_func)
                 FFT.setPhase(ph_patch)
                 FFT.ifft()
@@ -246,10 +254,10 @@ class BlockBaseFrameWork:
                 out_patch = self.__crop_center(out_patch, no_blocksize)
                 output_img[start_no_row:stop_no_row, start_no_col:stop_no_col] = out_patch
         
-        # Unpad all images
-        self.__img = self.__unpad(self.__img)
-        self.__freq_map_img = self.__unpad(self.__freq_map_img)
+        # Only unpad the reconstructed output; preserve internal padded state
         self.__output_img = self.__unpad(output_img)
+
+
     
     def apply_func_map(self, map_img, func, *args, output_is_img=True, output_vector=None, activation_map=None, custom_row_index=None, custom_col_index=None, iteration_size=1):
         o_blocksize = self.__overlap_blocksize
@@ -310,6 +318,7 @@ class BlockBaseFrameWork:
         return output_img    
         
     def get_img(self):
+        # return self.__unpad(self.__img)
         return self.__img
     
     # def get_mask(self):

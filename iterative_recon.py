@@ -14,195 +14,6 @@ from skimage.morphology import convex_hull_image
 
 from framework.blockattribute import BlockAttribute
 
-from cluster_growth import grow_reconstruct_crossing_iterative
-
-def project_line_supercover(p0: tuple[float, float], p1: tuple[float, float], shape: tuple[int, int] = None) -> list[tuple[int, int]]:
-    """
-    Finds ALL grid blocks (row, col) that a continuous geometric line segment 
-    from p0=(y0, x0) to p1=(y1, x1) physically intersects.
-    
-    Prevents pi/4 (45°) and pi/2 (90°) angle snapping artifacts.
-    """
-    y0, x0 = p0
-    y1, x1 = p1
-
-    curr_y, curr_x = int(np.floor(y0)), int(np.floor(x0))
-    end_y, end_x = int(np.floor(y1)), int(np.floor(x1))
-
-    dy = y1 - y0
-    dx = x1 - x0
-
-    step_y = 1 if dy > 0 else (-1 if dy < 0 else 0)
-    step_x = 1 if dx > 0 else (-1 if dx < 0 else 0)
-
-    # Parametric t step sizes along continuous ray L(t) = P0 + t * dP
-    if dy != 0:
-        t_max_y = (curr_y + (1 if step_y > 0 else 0) - y0) / dy
-        t_delta_y = abs(1.0 / dy)
-    else:
-        t_max_y = float('inf')
-        t_delta_y = float('inf')
-
-    if dx != 0:
-        t_max_x = (curr_x + (1 if step_x > 0 else 0) - x0) / dx
-        t_delta_x = abs(1.0 / dx)
-    else:
-        t_max_x = float('inf')
-        t_delta_x = float('inf')
-
-    blocks = []
-    H, W = shape if shape is not None else (float('inf'), float('inf'))
-    max_steps = int(abs(curr_x - end_x) + abs(curr_y - end_y)) + 50
-
-    for _ in range(max_steps):
-        if 0 <= curr_y < H and 0 <= curr_x < W:
-            if not blocks or blocks[-1] != (curr_y, curr_x):
-                blocks.append((curr_y, curr_x))
-
-        if curr_x == end_x and curr_y == end_y:
-            break
-
-        # Move to whichever cell boundary (X or Y) is encountered first along ray
-        if t_max_x < t_max_y:
-            t_max_x += t_delta_x
-            curr_x += step_x
-        elif t_max_y < t_max_x:
-            t_max_y += t_delta_y
-            curr_y += step_y
-        else: # Exact corner boundary intersection
-            t_max_x += t_delta_x
-            t_max_y += t_delta_y
-            curr_x += step_x
-            curr_y += step_y
-
-    return blocks
-
-def get_crossing_trajectories(crossings_output: list, shape: tuple[int, int] = None) -> list[dict]:
-    """
-    Projects rays from source block cell centers (sy + 0.5, sx + 0.5) 
-    to exact floating-point crossing coordinates (cy, cx).
-    """
-    results = []
-
-    for item in crossings_output:
-        cy, cx = item[0]
-        source_blocks = item[1:]
-        line_paths = []
-
-        for sy, sx in source_blocks:
-            # Ray origin at center of source block
-            p0 = (sy + 0.5, sx + 0.5)
-            p1 = (cy, cx)
-            
-            # Extract intersected grid blocks along continuous vector
-            path_blocks = project_line_supercover(p0, p1, shape=shape)
-            line_paths.append(path_blocks)
-
-        results.append({
-            'crossing_point': (cy, cx),
-            'source_blocks': source_blocks,
-            'line_paths': line_paths
-        })
-
-    return results
-
-def visualize_crossing_blocks(shape: tuple[int, int], 
-                              trajectories_data: list[dict], 
-                              background_image=None, 
-                              activation_map=None, 
-                              cmap='gray', 
-                              block_size=16):
-    """
-    Plots continuous ray vector lines and intersected grid blocks overlayed 
-    directly on a full-resolution pixel background image.
-
-    Parameters:
-        shape: (H, W) dimensions in block grid space.
-        trajectories_data: Output list from `get_crossing_trajectories`.
-        background_image: 2D image array in pixel space (e.g. pad_img).
-        activation_map: 2D block activation array (H, W).
-        cmap: Colormap for background_image.
-        block_size: Pixel size per block cell (default: 16).
-    """
-    H, W = shape
-    pix_W = W * block_size
-    pix_H = H * block_size
-
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    # 1. Background image overlay (spans native pixel coordinates)
-    if background_image is not None:
-        img_h, img_w = background_image.shape[:2]
-        ax.imshow(background_image, cmap=cmap, origin='upper', 
-                  extent=[0, img_w, img_h, 0], alpha=0.75)
-    elif activation_map is not None:
-        ax.imshow(activation_map, cmap='Blues', origin='upper', 
-                  extent=[0, pix_W, pix_H, 0], alpha=0.3)
-    else:
-        grid_bg = np.zeros((pix_H, pix_W))
-        ax.imshow(grid_bg, cmap='gray_r', alpha=0.05, origin='upper',
-                  extent=[0, pix_W, pix_H, 0])
-
-    # Optional: Overlay activation map on top of background image if both provided
-    if background_image is not None and activation_map is not None:
-        ax.imshow(activation_map, cmap='Blues', origin='upper', 
-                  extent=[0, pix_W, pix_H, 0], alpha=0.3)
-
-    # 2. Block Grid Lines on exact 16-pixel boundaries
-    ax.set_xticks(np.arange(0, pix_W + 1, block_size))
-    ax.set_yticks(np.arange(0, pix_H + 1, block_size))
-    ax.grid(True, which='major', color='lightgray', linestyle='--', linewidth=0.7)
-
-    color_palette = mpl.colormaps['tab10']
-
-    # 3. Intersected Blocks & Continuous Trajectories
-    for cross_idx, item in enumerate(trajectories_data):
-        cy_block, cx_block = item['crossing_point']
-        paths = item['line_paths']
-        sources = item['source_blocks']
-
-        # Continuous crossing point in pixel coordinates
-        cx_pix = cx_block * block_size
-        cy_pix = cy_block * block_size
-
-        # Floating-point crossing marker (Red star)
-        ax.plot(cx_pix, cy_pix, '*', markersize=16, color='red', zorder=6,
-                label='Crossing Point (float)' if cross_idx == 0 else "")
-
-        for line_idx, (path, (sy, sx)) in enumerate(zip(paths, sources)):
-            color = color_palette((cross_idx * 3 + line_idx) % 10)
-
-            # Highlight each intersected 16x16 pixel block cell
-            for y, x in path:
-                rect = plt.Rectangle((x * block_size, y * block_size), 
-                                     block_size, block_size, 
-                                     facecolor=color, alpha=0.35, 
-                                     edgecolor=color, linewidth=1.2, zorder=3)
-                ax.add_patch(rect)
-
-            # Source block center in pixel coordinates
-            sx_pix = (sx + 0.5) * block_size
-            sy_pix = (sy + 0.5) * block_size
-
-            # True continuous ray line: Source Center -> Crossing Point
-            ax.plot([sx_pix, cx_pix], [sy_pix, cy_pix], '-', color=color, linewidth=2, zorder=5,
-                    label=f'Ray {cross_idx+1}-{line_idx+1}')
-
-            # Mark Source Block Center
-            ax.plot(sx_pix, sy_pix, 's', color='darkgreen', markersize=7, zorder=6,
-                    label='Source Center' if (cross_idx == 0 and line_idx == 0) else "")
-
-    # 4. Axes & Image Coordinate Setup (Row Y down, Col X right)
-    ax.set_xlim(-block_size, pix_W + block_size)
-    ax.set_ylim(pix_H + block_size, -block_size)
-
-    ax.set_xlabel("Col X (Pixels)")
-    ax.set_ylabel("Row Y (Pixels)")
-    ax.set_title(f"Continuous Ray Trajectories & Intersected Blocks ({block_size}x{block_size} Grid)")
-    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0))
-    plt.tight_layout()
-    plt.show()
-
 def check_8_con(pos_list, ks_map):
     filter_pos_list = []
     for pos in pos_list:
@@ -220,7 +31,7 @@ def check_8_con(pos_list, ks_map):
             filter_pos_list.append(pos)
     return filter_pos_list
 
-
+def angle_diff(a: float, b: float) -> float:
     """
     Computes the shortest unoriented angle difference between two angles in radians.
     
@@ -305,398 +116,12 @@ def peak_2_peak_min_distance(couple_peak_pos:tuple, couple_peak_comp_pos:tuple):
         d_r = d_r_temp
     return d_r
 
-def find_crossing_point(blocks, orientations):
-    """
-    Finds the intersection point of multiple lines given their origins and orientations.
-    
-    Args:
-        blocks: List of tuples (y, x) representing the source points.
-        orientations: List of floats representing the angles (theta) in radians.
-        
-    Returns:
-        Tuple (cross_y, cross_x) representing the crossing point, 
-        or None if no lines intersect (e.g., all are parallel).
-    """
-    if len(blocks) < 2 or len(blocks) != len(orientations):
-        return None
-        
-    blocks = np.array(blocks)
-    ys = blocks[:, 0]
-    xs = blocks[:, 1]
-    thetas = np.array(orientations, dtype=float)
-    
-    # Line equation components: A*x + B*y = C
-    A = np.sin(thetas)
-    B = -np.cos(thetas)
-    C = xs * A + ys * B
-    
-    cross_xs = []
-    cross_ys = []
-    
-    N = len(blocks)
-    # Calculate all pairwise intersections
-    for i in range(N - 1):
-        for j in range(i + 1, N):
-            Det = A[i] * B[j] - A[j] * B[i]
-            
-            # Skip if lines are practically parallel
-            if abs(Det) > 1e-6:
-                cross_x = (C[i] * B[j] - C[j] * B[i]) / Det
-                cross_y = (A[i] * C[j] - A[j] * C[i]) / Det
-                
-                cross_xs.append(cross_x)
-                cross_ys.append(cross_y)
-                
-    if not cross_xs:
-        return None # No valid intersections found
-        
-    # Average the intersections if there are more than 2 lines
-    avg_y = float(np.mean(cross_ys))
-    avg_x = float(np.mean(cross_xs))
-    
-    return (avg_y, avg_x)
-
-def visualize_single_crossing_centroid(ori_array, crossing_data, centroid_block, crossing_idx, extension_length=8.0, background_image=None, cmap='gray', block_size=16, offset=24):
-    """
-    Visualizes a single original crossing and its new centroid on the full image.
-    Pops up in a separate Matplotlib window for each crossing.
-    Includes dashed lines to show how the orientation projection changed.
-    """
-    H = len(ori_array)
-    W = len(ori_array[0]) if H > 0 else 0
-    
-    pix_W = W * block_size
-    pix_H = H * block_size
-    
-    # Create a new figure for this specific crossing
-    fig, ax = plt.subplots(figsize=(10, 10))
-    if hasattr(fig.canvas.manager, 'set_window_title'):
-        fig.canvas.manager.set_window_title(f"Crossing {crossing_idx} Comparison")
-        
-    ax.set_xlim(-block_size + offset, pix_W + block_size + offset)
-    ax.set_ylim(-block_size + offset, pix_H + block_size + offset)
-    ax.invert_yaxis()
-    
-    # 1. Render background image
-    if background_image is not None:
-        img_h, img_w = background_image.shape[:2]
-        ax.imshow(background_image, cmap=cmap, origin='upper', 
-                  extent=[0, img_w, img_h, 0], alpha=0.75)
-    
-    # 2. Pixel Grid lines
-    ax.set_xticks(np.arange(offset, pix_W + offset + 1, block_size))
-    ax.set_yticks(np.arange(offset, pix_H + offset + 1, block_size))
-    ax.grid(which='major', color='lightgray', linestyle='-', linewidth=0.5, alpha=0.7)
-    
-    # 3. Orientation Field
-    for y in range(H):
-        for x in range(W):
-            theta = ori_array[y][x]
-            if theta is not None:
-                line_len = (block_size / 2) - 1 
-                dx = np.cos(theta) * line_len
-                dy = np.sin(theta) * line_len
-                cx_pixel = offset + x * block_size + (block_size / 2)
-                cy_pixel = offset + y * block_size + (block_size / 2)
-                ax.plot([cx_pixel - dx, cx_pixel + dx], 
-                        [cy_pixel - dy, cy_pixel + dy], 
-                        color='white' if background_image is not None else 'dimgray', 
-                        linewidth=1.5)
-    
-    # 4. Plot this specific Crossing, its Centroid, and Shifts
-    cy_block, cx_block = crossing_data[0] 
-    blocks = crossing_data[1:]
-    color = '#d62728' # Red for the old data
-    new_color = '#00FF00' # Bright Green for the new data
-    
-    # Apply offset for Old Crossing
-    old_cx_pixel = offset + cx_block * block_size
-    old_cy_pixel = offset + cy_block * block_size
-    
-    # Apply offset for New Centroid
-    cent_cy_block, cent_cx_block = centroid_block
-    new_cx_pixel = offset + cent_cx_block * block_size
-    new_cy_pixel = offset + cent_cy_block * block_size
-    
-    added_old_label = False
-    added_new_label = False
-    
-    # Draw Source Blocks and both projection lines
-    for (by, bx) in blocks:
-        bx_center = offset + bx * block_size + (block_size / 2)
-        by_center = offset + by * block_size + (block_size / 2)
-        ax.scatter(bx_center, by_center, color=color, marker='s', s=40, edgecolor='black', zorder=4)
-        
-        # --- OLD Projection Line (Solid, Faded Red) ---
-        dist_pixel_old = np.hypot(old_cx_pixel - bx_center, old_cy_pixel - by_center)
-        if dist_pixel_old > 0:
-            ext_pixel = extension_length * block_size
-            ex_old = old_cx_pixel + ((old_cx_pixel - bx_center) / dist_pixel_old) * ext_pixel
-            ey_old = old_cy_pixel + ((old_cy_pixel - by_center) / dist_pixel_old) * ext_pixel
-            ax.plot([bx_center, ex_old], [by_center, ey_old], color=color, linestyle='-', 
-                    alpha=0.3, linewidth=2.0, label='Old Projection' if not added_old_label else "")
-            added_old_label = True
-
-        # --- NEW Projection Line (Dashed, Bright Green) ---
-        dist_pixel_new = np.hypot(new_cx_pixel - bx_center, new_cy_pixel - by_center)
-        if dist_pixel_new > 0:
-            ext_pixel = extension_length * block_size
-            ex_new = new_cx_pixel + ((new_cx_pixel - bx_center) / dist_pixel_new) * ext_pixel
-            ey_new = new_cy_pixel + ((new_cy_pixel - by_center) / dist_pixel_new) * ext_pixel
-            ax.plot([bx_center, ex_new], [by_center, ey_new], color=new_color, linestyle='--', 
-                    alpha=0.8, linewidth=2.0, label='New Projection' if not added_new_label else "")
-            added_new_label = True
-
-    # Plot Old Crossing (Star)
-    ax.scatter(old_cx_pixel, old_cy_pixel, color=color, marker='*', s=300, edgecolor='black', alpha=0.5, zorder=5, label='Old Crossing')
-    
-    # Plot New Centroid (Plus)
-    ax.scatter(new_cx_pixel, new_cy_pixel, color=new_color, marker='P', s=200, edgecolor='black', zorder=6, label='New Centroid')
-    
-    # Draw connecting shift line between Old Crossing and New Centroid
-    ax.plot([old_cx_pixel, new_cx_pixel], [old_cy_pixel, new_cy_pixel], color='yellow', linestyle=':', linewidth=2, zorder=5, label='Shift Vector')
-
-    ax.set_title(f"Crossing #{crossing_idx} | Old vs Centroid Shift (Offset={offset})")
-    ax.set_xlabel("X (Pixels)")
-    ax.set_ylabel("Y (Pixels)")
-    
-    # Deduplicate legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), loc='upper right')
-    
-    plt.tight_layout()
-    plt.show(block=False)
-
-def mask_block_magnitude(patch_magnitude, double_peak_positions, thresh=0.8):
-    """
-    Applies map_clustering_peak_threshold for symmetric double peaks 
-    and returns the masked frequency magnitude patch.
-    """
-    clusters = map_clustering_peak_threshold(patch_magnitude, double_peak_positions, thresh=thresh)
-    if not clusters:
-        return patch_magnitude
-        
-    combined_mask = np.clip(np.sum(clusters, axis=0), 0, 1).astype(np.float32)
-    return patch_magnitude * combined_mask
-
-def mask_block_magnitude_watershed(patch_magnitude, double_peak_positions, thresh=0.8):
-    """
-    Applies marker-based watershed segmentation for symmetric double peaks 
-    using the updated BlockAttribute class, and returns the masked frequency patch.
-    """
-    # 1. Instantiate the BlockAttribute with the current frequency patch
-    BA = BlockAttribute(patch_magnitude)
-    
-    # 2. Manually inject the tracked peak pair to act as the watershed markers.
-    # This forces the watershed algorithm to only grow from the selected trajectory.
-    pos, inv_pos = double_peak_positions
-    BA.couple_peak = [{"position": (pos, inv_pos)}]
-    
-    # 3. Run the new watershed segmentation
-    binary_mask, labeled_clusters, paired_masks = BA.segment_peaks_watershed()
-    
-    # 4. Fallback if the segmentation fails or returns empty
-    if binary_mask is None or np.count_nonzero(binary_mask) == 0:
-        return patch_magnitude
-        
-    # 5. Convert the 255-based uint8 mask to a 0.0-1.0 float32 multiplier
-    combined_mask = (binary_mask > 0).astype(np.float32)
-    
-    return patch_magnitude * combined_mask
-
-def convert_to_triangular_mask(mask, ori):
-    """
-    Converts a single isolated pair mask into bounded triangular sectors (wedges) that:
-    1. Match the max angular spread of the original peak.
-    2. Terminate at the maximum radial distance (frequency) of the original pair.
-    
-    Args:
-        mask (np.ndarray): 2D binary mask.
-        ori (float): Orientation angle of the mask in degrees.
-        
-    Returns:
-        np.ndarray: The new triangular mask.
-    """
-    if mask is None or not np.any(mask):
-        return mask
-
-    h, w = mask.shape
-    cy, cx = h // 2, w // 2
-    
-    # Find coordinates of the original pair mask pixels
-    Y, X = np.where(mask > 0)
-    
-    # Exclude center pixel to avoid division by zero
-    valid = (Y != cy) | (X != cx)
-    Y_valid, X_valid = Y[valid], X[valid]
-    
-    if len(Y_valid) == 0:
-        return mask.copy()
-    
-    # 1. Compute maximum angular spread (theta width)
-    theta_mask = np.degrees(np.arctan2(Y_valid - cy, X_valid - cx))
-    diff = np.abs(theta_mask - ori) % 180.0
-    diff = np.minimum(diff, 180.0 - diff)
-    max_width = np.max(diff)
-    max_width = max(max_width, 1.5)  # Enforce minimum angular width
-    
-    # 2. Compute maximum frequency radius (r max)
-    radial_distances = np.hypot(Y_valid - cy, X_valid - cx)
-    r_max = np.max(radial_distances)
-    
-    # 3. Create polar grid for the entire block
-    YY, XX = np.indices((h, w))
-    dy, dx = YY - cy, XX - cx
-    grid_r = np.hypot(dy, dx)
-    grid_theta = np.degrees(np.arctan2(dy, dx))
-    
-    # Calculate angular difference on grid
-    diff_grid = np.abs(grid_theta - ori) % 180.0
-    diff_grid = np.minimum(diff_grid, 180.0 - diff_grid)
-    
-    # 4. Combine angular condition AND radial cap condition
-    angle_condition = (diff_grid <= max_width)
-    radius_condition = (grid_r <= r_max)
-    
-    new_mask = (angle_condition & radius_condition).astype(mask.dtype)
-    
-    # Keep DC component active
-    new_mask[cy, cx] = 1
-    
-    return new_mask
-
-# def mask_block_magnitude_triangle(patch_magnitude, double_peak_positions, thresh=0.8):
-#     """
-#     Applies marker-based watershed segmentation for symmetric double peaks 
-#     using the updated BlockAttribute class, and returns the masked frequency patch.
-#     """
-#     # 1. Instantiate the BlockAttribute with the current frequency patch
-#     BA = BlockAttribute(patch_magnitude)
-    
-#     # 2. Manually inject the tracked peak pair to act as the watershed markers.
-#     # This forces the watershed algorithm to only grow from the selected trajectory.
-#     pos, inv_pos = double_peak_positions
-#     BA.couple_peak = [{"position": (pos, inv_pos)}]
-    
-#     # 3. Run the new watershed segmentation
-#     binary_mask, labeled_clusters, paired_masks = BA.segment_peaks_watershed()
-    
-#     # 4. Fallback if the segmentation fails or returns empty
-#     if binary_mask is None or np.count_nonzero(binary_mask) == 0:
-#         return patch_magnitude
-
-#     binary_mask = convert_to_triangular_mask()
-    
-#     # 5. Convert the 255-based uint8 mask to a 0.0-1.0 float32 multiplier
-#     combined_mask = (binary_mask > 0).astype(np.float32)
-    
-#     return patch_magnitude * combined_mask
 
 
-def run_safe_istft(BBF, freq_map):
-    bbf_copy = copy.deepcopy(BBF)
-    bbf_copy.setMagnitude(freq_map)
-    bbf_copy.istft()
-    return bbf_copy.get_output_img()
 
-def animate_reconstruction_and_growth(ori_array, history, crossing_idx, background_image=None, 
-                                      cmap='gray', block_size=16, offset=24, extension_length=8.0):
-    """
-    Renders frame-by-frame animation:
-    Left Subplot  -> Reconstructed Spatial Image from masked iSTFT
-    Right Subplot -> Cluster growth and Centroid trajectory
 
-    #### ---- 
-    """
-    H = len(ori_array)
-    W = len(ori_array[0]) if H > 0 else 0
-    pix_W, pix_H = W * block_size, H * block_size
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 9))
-    if hasattr(fig.canvas.manager, 'set_window_title'):
-        fig.canvas.manager.set_window_title(f"Crossing {crossing_idx} - iSTFT Reconstruction & Growth")
-        
-    def update(frame):
-        ax1.clear()
-        ax2.clear()
-        
-        state = history[frame]
-        step = state['step']
-        cluster = state['cluster']
-        centroid_block = state['centroid']
-        reconstructed_img = state['reconstructed_img']
-        
-        # --- SUBPLOT 1: Spatial Image Reconstruction ---
-        ax1.imshow(reconstructed_img, cmap='gray')
-        ax1.set_title(f"iSTFT Spatial Reconstruction (Step {step})")
-        ax1.axis('off')
-        
-        # --- SUBPLOT 2: Cluster Growth & Orientation Field ---
-        ax2.set_xlim(-block_size + offset, pix_W + block_size + offset)
-        ax2.set_ylim(-block_size + offset, pix_H + block_size + offset)
-        ax2.invert_yaxis()
-        
-        if background_image is not None:
-            img_h, img_w = background_image.shape[:2]
-            ax2.imshow(background_image, cmap=cmap, origin='upper', 
-                       extent=[0, img_w, img_h, 0], alpha=0.5)
-            
-        ax2.set_xticks(np.arange(offset, pix_W + offset + 1, block_size))
-        ax2.set_yticks(np.arange(offset, pix_H + offset + 1, block_size))
-        ax2.grid(which='major', color='lightgray', linestyle='-', linewidth=0.5, alpha=0.5)
-        
-        # Draw base orientation field
-        for y in range(H):
-            for x in range(W):
-                theta = ori_array[y][x]
-                if theta is not None:
-                    line_len = (block_size / 2) - 1 
-                    dx = np.cos(theta) * line_len
-                    dy = np.sin(theta) * line_len
-                    cx_pixel = offset + x * block_size + (block_size / 2)
-                    cy_pixel = offset + y * block_size + (block_size / 2)
-                    ax2.plot([cx_pixel - dx, cx_pixel + dx], 
-                             [cy_pixel - dy, cy_pixel + dy], 
-                             color='white' if background_image is not None else 'dimgray', 
-                             linewidth=1.0, alpha=0.3)
-        
-        # Apply offset to centroid
-        cent_cy_block, cent_cx_block = centroid_block
-        new_cx_pixel = offset + cent_cx_block * block_size
-        new_cy_pixel = offset + cent_cy_block * block_size
-        
-        # Plot Cluster Blocks & Projections
-        for (by, bx) in cluster:
-            bx_center = offset + bx * block_size + (block_size / 2)
-            by_center = offset + by * block_size + (block_size / 2)
-            
-            is_new = (by, bx) in state['new_blocks'] and step > 0
-            block_color = 'cyan' if is_new else '#d62728'
-            
-            ax2.scatter(bx_center, by_center, color=block_color, marker='s', s=50, edgecolor='black', zorder=4)
-            
-            dist_pixel = np.hypot(new_cx_pixel - bx_center, new_cy_pixel - by_center)
-            if dist_pixel > 0:
-                ext_pixel = extension_length * block_size
-                ex = new_cx_pixel + ((new_cx_pixel - bx_center) / dist_pixel) * ext_pixel
-                ey = new_cy_pixel + ((new_cy_pixel - by_center) / dist_pixel) * ext_pixel
-                ax2.plot([bx_center, ex], [by_center, ey], color='#00FF00', linestyle='--', alpha=0.5, linewidth=1.5)
 
-        # Plot Trajectory & Current Centroid
-        traj_x = [offset + h['centroid'][1] * block_size for h in history[:frame+1]]
-        traj_y = [offset + h['centroid'][0] * block_size for h in history[:frame+1]]
-        ax2.plot(traj_x, traj_y, color='yellow', linestyle='-', linewidth=2, marker='o', markersize=4, zorder=5)
-        ax2.scatter(new_cx_pixel, new_cy_pixel, color='#00FF00', marker='P', s=200, edgecolor='black', zorder=6)
-        
-        ax2.set_title(f"Cluster Expansion | Step {step}/{len(history)-1} | Blocks: {len(cluster)}")
-        ax2.set_xlabel("X (Pixels)")
-        ax2.set_ylabel("Y (Pixels)")
-        plt.tight_layout()
 
-    anim = FuncAnimation(fig, update, frames=len(history), interval=900, repeat=False)
-    plt.show()
-    return anim
 
 def fft_peak_mean_var(magnitude_block, lpf_radius=15, hpf_radius=3):
     filter = FreqFilter(magnitude_block.shape)
@@ -709,6 +134,15 @@ def fft_peak_mean_var(magnitude_block, lpf_radius=15, hpf_radius=3):
         return 0
     Q = np.var(values)*np.max(values)/np.mean(values)
     return Q
+
+def fft_var(magnitude_block, lpf_radius=15, hpf_radius=3):
+    filter = FreqFilter(magnitude_block.shape)
+    LPF = filter.getLPF(15, f_type="Ideal")
+    HPF = filter.getHPF(3, f_type="Ideal")
+    banded = magnitude_block * LPF * HPF
+
+    values = banded[banded != 0]
+    return np.var(values)
 
 def generate_pmv_mask(pmv_map, limit_ratio=0.1):
     """
@@ -726,6 +160,249 @@ def generate_pmv_mask(pmv_map, limit_ratio=0.1):
         
     return hard_limit_mask
 
+def get8connect_index(pos:tuple):
+    row, col = pos
+    OFFSETS_8 = [
+    (-1, -1), (-1, 0), (-1, 1),
+    ( 0, -1),          ( 0, 1),
+    ( 1, -1), ( 1, 0), ( 1, 1)
+    ]
+    return [(row+OFFSETS_8[idx][0], col+OFFSETS_8[idx][1]) for idx in range(8)]
+
+import matplotlib.patches as patches
+def _to_hw(size):
+    """Normalize an int or (height, width) tuple into a (h, w) tuple."""
+    if size is None:
+        return None
+    if isinstance(size, (int, np.integer)):
+        return (int(size), int(size))
+    return (int(size[0]), int(size[1]))
+
+
+def plot_orientation_map(
+    orientation_2d,
+    background_image=None,
+    overlap_block_size=None,
+    non_overlap_block_size=None,
+    directed=False,
+    show_vectors=True,
+    show_block_grid=False,
+    overlay_alpha=0.45,
+    missing_color=None,
+    vector_color="black",
+    padded_blocks="auto",
+):
+    """
+    Plots a 2D orientation map in radians, optionally overlaid on a background image
+    using overlapping and non-overlapping block dimensions.
+
+    Parameters:
+    - orientation_2d: 2D list or NumPy array of angles in radians (None = no orientation).
+    - background_image: Optional 2D (grayscale) or 3D (RGB/RGBA) NumPy array.
+    - overlap_block_size: Int or (h, w) tuple for the full analysis window size (W).
+    - non_overlap_block_size: Int or (h, w) tuple for the core block / step size (S).
+    - directed: False wraps angles to [0, pi); True wraps angles to [0, 2*pi).
+    - show_vectors: If True, draws orientation line segments or arrows at block centers.
+    - show_block_grid: If True, draws the non-overlapping tile grid and an example
+                       overlapping window boundary.
+    - overlay_alpha: Opacity (0 to 1) of the orientation heatmap when background_image is set.
+    - missing_color: Color for None/NaN cells. Defaults to 'lightgray' without a background
+                     image, or 'none' (transparent) when background_image is provided.
+    - vector_color: Color of the orientation lines/arrows.
+    - padded_blocks: 'auto', True, or False. Determines whether block (0, 0) is centered on
+                     the non-overlapping tile (True, padded image) or the full overlapping
+                     window (False, unpadded sliding window).
+    """
+    angles = np.array(orientation_2d, dtype=float)
+    rows, cols = angles.shape
+
+    period = 2 * np.pi if directed else np.pi
+    angles = np.mod(angles, period)
+
+    # Resolve block sizes (W = overlap window size, S = non-overlap step/core size)
+    W = _to_hw(overlap_block_size)
+    S = _to_hw(non_overlap_block_size)
+
+    if S is None and W is not None:
+        S = W
+    elif W is None and S is not None:
+        W = S
+    elif W is None and S is None:
+        if background_image is not None:
+            img_h, img_w = background_image.shape[:2]
+            S = (img_h / rows, img_w / cols)
+        else:
+            S = (1, 1)
+        W = S
+
+    S_h, S_w = S
+    W_h, W_w = W
+
+    # Determine center coordinates of each block in image pixel space
+    if padded_blocks == "auto":
+        if background_image is not None and (W_h != S_h or W_w != S_w):
+            img_h, img_w = background_image.shape[:2]
+            unpadded_err = abs(img_w - ((cols - 1) * S_w + W_w)) + abs(img_h - ((rows - 1) * S_h + W_h))
+            padded_err = abs(img_w - (cols * S_w)) + abs(img_h - (rows * S_h))
+            use_padded = padded_err < unpadded_err
+        else:
+            use_padded = True
+    else:
+        use_padded = bool(padded_blocks)
+
+    # Pixel (0, 0) spans [-0.5, 0.5], so a block of size B starting at 0 is centered at (B - 1) / 2
+    start_x = (S_w - 1) / 2.0 if use_padded else (W_w - 1) / 2.0
+    start_y = (S_h - 1) / 2.0 if use_padded else (W_h - 1) / 2.0
+
+    x_centers = start_x + np.arange(cols) * S_w
+    y_centers = start_y + np.arange(rows) * S_h
+
+    # Configure colormap and missing-value rendering
+    if missing_color is None:
+        missing_color = "none" if background_image is not None else "lightgray"
+
+    cmap = plt.get_cmap("twilight").copy()
+    if str(missing_color).lower() in ("none", "transparent"):
+        cmap.set_bad(alpha=0.0)
+    else:
+        cmap.set_bad(color=missing_color)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    # 1. Plot background image if provided
+    if background_image is not None:
+        bg_cmap = "gray" if background_image.ndim == 2 else None
+        ax.imshow(background_image, cmap=bg_cmap, origin="upper")
+
+    # 2. Plot orientation heatmap aligned to the non-overlapping block tiles
+    extent = [
+        x_centers[0] - S_w / 2.0,
+        x_centers[-1] + S_w / 2.0,
+        y_centers[-1] + S_h / 2.0,
+        y_centers[0] - S_h / 2.0,
+    ]
+    alpha = overlay_alpha if background_image is not None else 1.0
+    im = ax.imshow(
+        angles,
+        cmap=cmap,
+        vmin=0,
+        vmax=period,
+        origin="upper",
+        extent=extent,
+        alpha=alpha,
+    )
+
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if directed:
+        cbar.set_ticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
+        cbar.set_ticklabels(["0", "π/2", "π", "3π/2", "2π"])
+    else:
+        cbar.set_ticks([0, np.pi / 4, np.pi / 2, 3 * np.pi / 4, np.pi])
+        cbar.set_ticklabels(["0", "π/4", "π/2", "3π/4", "π"])
+    cbar.set_label("Orientation (radians)")
+
+    # 3. Overlay orientation vectors in image data coordinates
+    if show_vectors:
+        X, Y = np.meshgrid(x_centers, y_centers)
+        U = np.cos(angles)
+        V = np.sin(angles)
+        vec_len = 0.75 * min(S_w, S_h)
+
+        quiver_kwargs = dict(
+            angles="xy",
+            scale_units="xy",
+            scale=1.0 / vec_len,
+            pivot="mid",
+            color=vector_color,
+        )
+        if not directed:
+            quiver_kwargs.update(headwidth=0, headlength=0, headaxislength=0)
+
+        ax.quiver(X, Y, U, V, **quiver_kwargs)
+
+    # 4. Optionally draw non-overlapping tile grid and an example overlapping block
+    if show_block_grid:
+        x_edges = np.append(x_centers - S_w / 2.0, x_centers[-1] + S_w / 2.0)
+        y_edges = np.append(y_centers - S_h / 2.0, y_centers[-1] + S_h / 2.0)
+        ax.vlines(x_edges, y_edges[0], y_edges[-1], colors="white", linestyles=":", linewidth=0.8, alpha=0.8)
+        ax.hlines(y_edges, x_edges[0], x_edges[-1], colors="white", linestyles=":", linewidth=0.8, alpha=0.8)
+
+        if W_w != S_w or W_h != S_h:
+            # Highlight the first overlapping window (W_w x W_h) for visual reference
+            rect = patches.Rectangle(
+                (x_centers[0] - W_w / 2.0, y_centers[0] - W_h / 2.0),
+                W_w,
+                W_h,
+                linewidth=1.5,
+                edgecolor="yellow",
+                facecolor="none",
+                linestyle="--",
+                label=f"Overlap window ({W_w}×{W_h})",
+            )
+            ax.add_patch(rect)
+            ax.legend(loc="upper right", framealpha=0.7)
+
+    ax.set_title("2D Orientation Map")
+    ax.set_xlabel("X (pixels)")
+    ax.set_ylabel("Y (pixels)")
+    plt.tight_layout()
+    plt.show()
+
+
+from numpy.lib.stride_tricks import sliding_window_view
+def sobel_ignore_none(arr: np.ndarray, keep_none: bool = True):
+    """
+    Apply a 2D Sobel filter to a dtype=object array containing numbers and None.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        2D array (dtype=object) with numeric values and None.
+    keep_none : bool
+        If True, returns dtype=object arrays with original None positions preserved.
+        If False, returns float64 arrays with np.nan at original None positions.
+
+    Returns
+    -------
+    gx, gy, magnitude : tuple of np.ndarray
+    """
+    # Convert None -> np.nan and numbers -> float64
+    data = np.array(arr, dtype=np.float64)
+    none_mask = np.isnan(data)
+
+    # Standard 3x3 Sobel kernels
+    kx = np.array([[-1, 0, 1],
+                   [-2, 0, 2],
+                   [-1, 0, 1]], dtype=np.float64)
+    ky = np.array([[-1, -2, -1],
+                   [ 0,  0,  0],
+                   [ 1,  2,  1]], dtype=np.float64)
+
+    # Pad borders with np.nan so edge cells ignore out-of-bounds neighbors
+    padded = np.pad(data, pad_width=1, mode="constant", constant_values=np.nan)
+    windows = sliding_window_view(padded, (3, 3))
+
+    # Ignore None (NaN) cells during the weighted sum
+    gx = np.nansum(windows * kx, axis=(-2, -1))
+    gy = np.nansum(windows * ky, axis=(-2, -1))
+    magnitude = np.hypot(gx, gy)
+
+    # Restore None / NaN at cells that were originally None
+    gx[none_mask] = np.nan
+    gy[none_mask] = np.nan
+    magnitude[none_mask] = np.nan
+
+    if keep_none:
+        def to_object(a):
+            out = a.astype(object)
+            out[none_mask] = None
+            return out
+
+        return to_object(gx), to_object(gy), to_object(magnitude)
+
+    return gx, gy, magnitude
+
+
 if __name__ == "__main__":
     
 
@@ -734,7 +411,7 @@ if __name__ == "__main__":
     from framework.blockbase_pipeline import BlockBaseFrameWork
     from framework.grouping_framework import BlockGroup
     from framework.orientation_estimation import ban_bandpass
-    from framework.orientation_estimation import banning_peak, local_multipeak
+    from framework.orientation_estimation import local_multipeak
     from framework.crossing_field import ban_bandpass_gaussian, exclude_boundary, visualize_crossings, find_orientation_crossings
 
     from framework.blockattribute import find_orientation, find_orientation_support_v
@@ -755,8 +432,7 @@ if __name__ == "__main__":
     # ---- ---- ----
 
     # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
-    # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
-    out_path = r"C:\work\image_processing\latent_fingerprint\model\data\data_tv"
+    out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
     save_dir = r"C:\work\image_processing\latent_fingerprint\model\data\output"
     for file in tqdm(glob(os.path.join(out_path, '*'))):
         # file = r"C:\work\image_processing\latent_fingerprint\model\data\data_tv\overlap_rim.png"
@@ -787,6 +463,20 @@ if __name__ == "__main__":
         pmv_map = normalize_image(pmv_map)
         pmv_mask = generate_pmv_mask(pmv_map, limit_ratio=0.1)
 
+        # ---- Create KS map
+        ks_map = np.zeros((len(row_map_index), len(col_map_index)))
+        ks_map = BBF.apply_func_map(magnitude, fft_peak_mean_var, output_is_img=False, output_vector=ks_map)
+        ks_map = normalize_image(ks_map)
+
+
+        # ---- Create VAR map
+        var_map = np.zeros((len(row_map_index), len(col_map_index)))
+        var_map = BBF.apply_func_map(magnitude, fft_peak_mean_var, output_is_img=False, output_vector=var_map)
+        var_map = normalize_image(var_map)
+        # plot_all([img, pmv_map, var_map], cmap=['gray', 'hot', 'hot']) # PMV and VAR map is the same
+
+
+
         # ---- Crop Kurtosis and picture for better Visualization ----
         block_pad = np.array(BBF.fp_pad)//no_block_size
         # ks_map = ks_map[block_pad[0]:-block_pad[1], block_pad[2]:-block_pad[3]]
@@ -813,28 +503,29 @@ if __name__ == "__main__":
         activation_map = mp_grp.generate_activation_map(pmv_map.shape[0], pmv_map.shape[1])
         activation_map = exclude_boundary(activation_map)
         activation_map = activation_map*pmv_mask        
-        plot_all([pad_img, pmv_map, activation_map], cmap=['gray', 'hot', 'gray'], title_list=["Original", "PMV Map", "Starting Peak Pos"])
+        # plot_all([pad_img, pmv_map, activation_map], cmap=['gray', 'hot', 'gray'], title_list=["Original", "PMV Map", "Starting Peak Pos"])
         
         # ---- Create Attribute map ----
         orientation_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.ndarray)
         orientation_map = BBF.apply_func_map(magnitude, find_orientation, output_is_img=False, output_vector=orientation_map)
         # ---- ---- ----
-        o_map = orientation_map
-        # ---- ---- ----
+        plot_orientation_map(orientation_map, background_image=pad_img, overlap_block_size=64, non_overlap_block_size=16, overlay_alpha=0.3)
 
+        gx, gy, magnitude = sobel_ignore_none(orientation_map, keep_none=False)
+        plot_all([magnitude, gx, gy])
         
-        # # 1. Run your original function (unmodified)
-        raw_crossings = find_orientation_crossings(o_map, d=2.0, dist_tol=1.5, cluster_tol=3.0, min_lines=2, max_crossings=100, inside_image_only=True, activation_map=activation_map)
-        crossings = []
-        for crossing in raw_crossings:
-            cy, cx = crossing[0] # Continuous float coordinates
-            icy, icx = int(round(cy)), int(round(cx))
-            if 0 <= icy < pmv_mask.shape[0] and 0 <= icx < pmv_mask.shape[1]:
-                if pmv_mask[icy, icx]: # Only keep if inside mask
-                    crossings.append(crossing)
+        # # # 1. Run your original function (unmodified)
+        # raw_crossings = find_orientation_crossings(orientation_map, d=2.0, dist_tol=1.5, cluster_tol=3.0, min_lines=2, max_crossings=100, inside_image_only=True, activation_map=activation_map)
+        # crossings = []
+        # for crossing in raw_crossings:
+        #     cy, cx = crossing[0] # Continuous float coordinates
+        #     icy, icx = int(round(cy)), int(round(cx))
+        #     if 0 <= icy < pmv_mask.shape[0] and 0 <= icx < pmv_mask.shape[1]:
+        #         if pmv_mask[icy, icx]: # Only keep if inside mask
+        #             crossings.append(crossing)
 
 
-        visualize_crossings(o_map, crossings, background_image=pad_img, cmap='gray')
+        # visualize_crossings(orientation_map, crossings, background_image=pad_img, cmap='gray')
         
         # r_idx, c_idx = 14, 14
         # r_idx, c_idx = 2, 0
@@ -849,120 +540,22 @@ if __name__ == "__main__":
         # plot_all([pad_img[p_row:p_row+16, p_col:p_col+16], magnitude[m_row:m_row+64, m_col:m_col+64]])
         # ---- ---- ----
         
-        # ---- CreateOrientation Tensor Map
-        attribute_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.ndarray)
-        attribute_map = BBF.apply_func_map(magnitude, find_orientation_support_v, output_is_img=False, output_vector=attribute_map)
-        # ---- ---- ----
+        # # ---- CreateOrientation Tensor Map
+        # attribute_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.ndarray)
+        # # each cell will contain couple_peak
+        # # You can get orientation from couple_peak[index]["orientation"]
+        # attribute_map = BBF.apply_func_map(magnitude, find_orientation_support_v, output_is_img=False, output_vector=attribute_map)
+        # # ---- ---- ----
 
+        # # Let us start with the non multi thread approach
+        # for crossing in crossings:
+        #     # Crossing is in the form of
+        #     # (crossingpoint), (index), (index), ...
+        #     crossing_pos = crossing[0] # Exact crossing position
+        #     source_indexes = crossing[1:] # All sources indexes (row, col)
 
-
-        
-        best_reconstruction = None
-        max_cluster_size = 0
-        animations = []
-        for crossing_idx, crossing in enumerate(crossings):
-            # Grow cluster
-            growth_history = grow_reconstruct_crossing_iterative(
-                BBF=BBF,
-                crossing=crossing,
-                attribute_map=attribute_map,
-                ks_map=pmv_map,
-                pmv_mask=pmv_mask,
-                min_kurtosis=0.5,
-                max_steps=30,
-                mask_thresh=0.7,
-                mask_func=mask_block_magnitude, 
-                istft_func=run_safe_istft
-            )
+        #     # Initiate Param
+        #     member = [source_index for source_index in source_indexes] # All source.
             
-            # 2. Render animation
-            anim = animate_reconstruction_and_growth(
-                ori_array=o_map,
-                history=growth_history,
-                crossing_idx=crossing_idx,
-                background_image=pad_img,
-                cmap='gray',
-                block_size=no_block_size,
-                offset=24
-            )
-            
-            # 3. Save as GIF
-            gif_filename = os.path.join("", f"{os.path.basename(file)}_crossing_{crossing_idx}.gif")
-            
-            print(f"Saving animation for crossing {crossing_idx}...")
-            # fps controls the speed (frames per second). Lower is slower.
-            anim.save(gif_filename, writer='pillow', fps=2) 
-            print(f"Saved: {gif_filename}")
-
-        # # ---- Save the best reconstruction to a directory ----
-        # if best_reconstruction is not None:
-        #     # Define output directory (e.g., alongside data_tv)
-        #     # save_dir = os.path.join(os.path.dirname(out_path), "reconstructed_outputs")
-        #     # os.makedirs(save_dir, exist_ok=True)
-            
-        #     # Normalize the iSTFT output to 0-255 uint8 for saving
-        #     output_img_normalized = cv.normalize(best_reconstruction, None, 0, 255, cv.NORM_MINMAX)
-        #     output_img_normalized = output_img_normalized.astype(np.uint8)
-            
-        #     filename = os.path.basename(file)
-        #     # save_path = os.path.join(save_dir, f"recon_{filename}")
-        #     save_path = os.path.join(save_dir, filename)
-            
-        #     cv.imwrite(save_path, output_img_normalized)
-
-
-
-
-
-
-        # all_centroids = []
-
-        # MIN_KURTOSIS_THRESHOLD = 0.5  # Adjust based on your ks_map distribution
-        # MAX_GROWTH_STEPS = 6
-
-        # animations = []
-
-        # for crossing_idx, crossing in enumerate(crossings):
-        #     # 1. Grow cluster, apply frequency peak mask, and compute iSTFT frame-by-frame
-        #     growth_history = grow_reconstruct_crossing_iterative(
-        #         BBF=BBF,
-        #         crossing=crossing,
-        #         attribute_map=attribute_map,
-        #         ks_map=pmv_map,
-        #         pmv_mask=pmv_mask,     # <--- Passed mask here
-        #         min_kurtosis=0.5,
-        #         max_steps=20,
-        #         mask_thresh=0.7,
-        #         # dist_thresh=7.0       # <--- Set distance threshold here
-        #     )
-            
-        #     # 2. Render side-by-side animation window
-        #     anim = animate_reconstruction_and_growth(
-        #         ori_array=o_map,
-        #         history=growth_history,
-        #         crossing_idx=crossing_idx,
-        #         background_image=pad_img,
-        #         cmap='gray',
-        #         block_size=no_block_size,
-        #         offset=24
-        #     )
-        #     animations.append(anim)
-
-        # plt.show()
-        #     # 2. Extract the iteration (state) that yielded the biggest cluster
-        #     best_state = max(growth_history, key=lambda state: len(state['cluster']))
-        #     best_reconstructed_img = best_state['reconstructed_img']
-        #     cluster_size = len(best_state['cluster'])
-            
-        #     # 3. Normalize the iSTFT float32 output into a standard 0-255 image for saving
-        #     norm_img = cv.normalize(best_reconstructed_img, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-            
-        #     # 4. Construct file name and save to disk
-        #     # base_name = os.path.splitext(os.path.basename(file))[0]
-        #     # out_filename = f"{base_name}_crossing_{crossing_idx}_size_{cluster_size}.png"
-        #     out_filename = os.path.basename(file)
-        #     out_filepath = os.path.join(save_dir, out_filename)
-            
-        #     cv.imwrite(out_filepath, norm_img)
-            
-        # print(f"Finished! All best reconstructions saved to: {save_dir}")
+        #     while True:
+        #         pass
