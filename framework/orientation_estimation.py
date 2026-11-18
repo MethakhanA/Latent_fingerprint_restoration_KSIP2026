@@ -54,6 +54,74 @@ def local_multipeak(block_img, radius_ban=3, max_peak_count=np.inf, mean_radius_
         peak_pos = [tuple(p) for p in peak_pos]
     return peak_pos
 
+# ---- STILL NOT VERIFIED #### METH 19/11/26
+from skimage.feature.peak import ensure_spacing
+def peak_local_kth_max(
+    image,
+    k=2,
+    min_distance=1,
+    threshold_abs=None,
+    threshold_rel=None,
+    exclude_border=True,
+    num_peaks=np.inf,
+    footprint=None,
+    strict_rank=True,
+    enforce_spacing=True,
+):
+    """
+    Find local k-th maxima in an N-D array, mirroring skimage.feature.peak_local_max.
+    k=1 -> 1st local max, k=2 -> 2nd local max, k=3 -> 3rd local max, etc.
+    """
+    if footprint is None:
+        size = 2 * min_distance + 1
+        footprint = np.ones((size,) * image.ndim, dtype=bool)
+    else:
+        footprint = np.asarray(footprint, dtype=bool)
+
+    if k < 1 or k > footprint.sum():
+        raise ValueError(f"k must be between 1 and footprint size ({footprint.sum()})")
+
+    # Threshold calculation matching peak_local_max
+    thresh = np.min(image) if threshold_abs is None else threshold_abs
+    if threshold_rel is not None:
+        thresh = max(thresh, np.max(image) * threshold_rel)
+
+    # k-th largest value in each local neighborhood (rank=-1 is max, -2 is 2nd max, etc.)
+    kth_val = ndi.rank_filter(image, rank=-k, footprint=footprint, mode="nearest")
+    mask = (image == kth_val) & (image > thresh)
+
+    # Avoid counting ties with (k-1)-th max as a k-th max
+    if strict_rank and k > 1:
+        prev_val = ndi.rank_filter(image, rank=-(k - 1), footprint=footprint, mode="nearest")
+        mask &= image < prev_val
+
+    # Border exclusion
+    if exclude_border:
+        border = min_distance if exclude_border is True else int(exclude_border)
+        if border > 0:
+            border_mask = np.zeros_like(mask, dtype=bool)
+            slices = tuple(slice(border, -border) for _ in range(image.ndim))
+            border_mask[slices] = True
+            mask &= border_mask
+
+    # Sort by intensity descending
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return coords
+
+    intensities = image[tuple(coords.T)]
+    coords = coords[np.argsort(-intensities, kind="stable")]
+
+    # Optional spacing suppression between returned k-th max points
+    if enforce_spacing and min_distance > 0:
+        max_out = int(num_peaks) if np.isfinite(num_peaks) else None
+        coords = ensure_spacing(coords, spacing=min_distance, max_out=max_out)
+
+    if np.isfinite(num_peaks):
+        coords = coords[:int(num_peaks)]
+
+    return coords
+
 # ---- Hierarchical Clustering
 def find_peaks_adaptive_hierarchical(image, max_distance, neighborhood_size=3, noise_floor=None):
     """

@@ -488,7 +488,7 @@ if __name__ == "__main__":
     # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
     out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
     # save_dir = r"C:\work\image_processing\latent_fingerprint\model\data\output"
-    out_path = r"D:\work\image_processing\Latent_fingerprint\SFP_latent_fingerprint_enh\segmentation\Latent_fingerprint_segmentation_KSIP2026\data\sd302h_original_500ppi"
+    # out_path = r"D:\work\image_processing\Latent_fingerprint\SFP_latent_fingerprint_enh\segmentation\Latent_fingerprint_segmentation_KSIP2026\data\sd302h_original_500ppi"
     for file in tqdm(glob(os.path.join(out_path, '*'))):
         # file = r"C:\work\image_processing\latent_fingerprint\model\data\data_tv\overlap_rim.png"
         # if os.path.exists(os.path.join(save_dir, os.path.basename(file))):
@@ -518,10 +518,10 @@ if __name__ == "__main__":
         pmv_map = normalize_image(pmv_map)
         pmv_mask = generate_pmv_mask(pmv_map, limit_ratio=0.1)
 
-        # ---- Create KS map
-        ks_map = np.zeros((len(row_map_index), len(col_map_index)))
-        ks_map = BBF.apply_func_map(magnitude, fft_peak_mean_var, output_is_img=False, output_vector=ks_map)
-        ks_map = normalize_image(ks_map)
+        # # ---- Create KS map
+        # ks_map = np.zeros((len(row_map_index), len(col_map_index)))
+        # ks_map = BBF.apply_func_map(magnitude, fft_peak_mean_var, output_is_img=False, output_vector=ks_map)
+        # ks_map = normalize_image(ks_map)
 
 
         # ---- Create VAR map
@@ -546,10 +546,10 @@ if __name__ == "__main__":
         # # ---- ---- ----
         
         # /// C2: ---- Create Activation map from localmultipeak and banningpeak
-        max_pos_list = local_multipeak(pmv_map, mean_radius_ban=None, radius_ban=2, max_peak_count=np.inf)
+        max_pos_list = local_multipeak(pmv_map, mean_radius_ban=None, radius_ban=5, max_peak_count=np.inf)
         # max_pos_list = banning_peak(ks_map, mean_radius_ban=None)
         # -- Check if 8 connectivity have 0 kurtosis
-        max_pos_list = check_8_con(max_pos_list, pmv_map)
+        # max_pos_list = check_8_con(max_pos_list, pmv_map)
         row_mp_list, col_mp_list = [item[0] for item in max_pos_list], [item[1] for item in max_pos_list]
         mp_grp = BlockGroup(row_mp_list, col_mp_list)
         # ---- ---- ----
@@ -558,7 +558,7 @@ if __name__ == "__main__":
         activation_map = mp_grp.generate_activation_map(pmv_map.shape[0], pmv_map.shape[1])
         activation_map = exclude_boundary(activation_map)
         activation_map = activation_map*pmv_mask        
-        plot_all([pad_img, pmv_map, pmv_mask], cmap=['gray', 'hot', 'gray'], title_list=["Original", "PMV Map", "Starting Peak Pos"])
+        plot_all([pad_img, pmv_map, activation_map], cmap=['gray', 'hot', 'gray'], title_list=["Original", "PMV Map", "Starting Peak Pos"])
         
         # ---- Create max pos Orientation map ----
         orientation_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.ndarray)
@@ -578,7 +578,7 @@ if __name__ == "__main__":
         # # ---- ---- ----
 
         # # 1. Run your original function (unmodified)
-        raw_crossings = find_orientation_crossings(orientation_map, d=3.0, dist_tol=1, cluster_tol=1, min_lines=60, max_crossings=10000, inside_image_only=True, activation_map=pmv_mask)
+        raw_crossings = find_orientation_crossings(orientation_map, d=3.0, dist_tol=1, cluster_tol=1, min_lines=2, max_crossings=10000, inside_image_only=True, activation_map=activation_map)
         avg = 0
         crossings = []
         for crossing in raw_crossings:
