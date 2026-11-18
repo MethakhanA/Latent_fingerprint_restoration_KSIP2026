@@ -340,6 +340,23 @@ class BlockAttribute:
         #     angle = -angle
         return angle
     
+    def find_distance_peak_pos(self):
+        # Find Direction from max pos
+        row, col = self.row, self.col
+        x_center, y_center = self.x_center, self.y_center
+        pos = np.unravel_index(np.argmax(self.block_img), self.block_img.shape)
+        if pos[0]==(row//2):
+            inv_pos = (pos[0], col-pos[1])
+        elif pos[1]==(col//2):
+            inv_pos = (row-pos[0], pos[1])
+        else:
+            inv_pos = (row-pos[0], col-pos[1])
+        # p1, p2 = sorted([pos, inv_pos])
+        d_y = pos[0]-y_center
+        d_x = pos[1]-x_center
+        d_r = np.sqrt(d_x**2+d_y**2)
+        
+        return d_r    
     def find_magnitude(self):
         # ---- Pack magnitude into array
         couple_peak = self.couple_peak
@@ -397,6 +414,11 @@ def find_orientation(block_img):
         # plot_all(block_img)
         return None
     return couple_peak[list(couple_peak)[0]]["angle"]
+def find_frequency(block_img):
+    BA = BlockAttribute(block_img)
+    return BA.find_distance_peak_pos()
+
+
 def find_orientation_support_v(block_img):
     BA = BlockAttribute(block_img)
     BA.find_peak_pos()

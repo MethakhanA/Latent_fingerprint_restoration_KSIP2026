@@ -402,6 +402,60 @@ def sobel_ignore_none(arr: np.ndarray, keep_none: bool = True):
 
     return gx, gy, magnitude
 
+def laplacian_ignore_none(
+    arr: np.ndarray,
+    diagonal: bool = False,
+    keep_none: bool = False,
+) -> np.ndarray:
+    """
+    Apply a 2D Laplacian filter to a dtype=object array containing numbers and None.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        2D array (dtype=object) with numeric values and None.
+    diagonal : bool
+        If False (default), uses the 4-connected kernel (center -4).
+        If True, uses the 8-connected kernel including diagonals (center -8).
+    keep_none : bool
+        If False (default), returns a float64 array with np.nan at original None
+        positions (ready for matplotlib.pyplot.imshow).
+        If True, returns a dtype=object array with None preserved.
+
+    Returns
+    -------
+    np.ndarray
+    """
+    data = np.array(arr, dtype=np.float64)
+    none_mask = np.isnan(data)
+
+    if diagonal:
+        kernel = np.array([[1,  1, 1],
+                           [1, -8, 1],
+                           [1,  1, 1]], dtype=np.float64)
+    else:
+        kernel = np.array([[0,  1, 0],
+                           [1, -4, 1],
+                           [0,  1, 0]], dtype=np.float64)
+
+    padded = np.pad(data, pad_width=1, mode="constant", constant_values=np.nan)
+    windows = sliding_window_view(padded, (3, 3))
+
+    # Substituting NaN neighbors with the window's center value cancels their
+    # difference (neighbor - center = 0) and automatically adjusts the center
+    # weight from -4 (or -8) to match the number of valid neighbors.
+    filled = np.where(np.isnan(windows), data[:, :, None, None], windows)
+    lap = np.sum(filled * kernel, axis=(-2, -1))
+
+    lap[none_mask] = np.nan
+
+    if keep_none:
+        out = lap.astype(object)
+        out[none_mask] = None
+        return out
+
+    return lap
+
 
 if __name__ == "__main__":
     
@@ -414,7 +468,7 @@ if __name__ == "__main__":
     from framework.orientation_estimation import local_multipeak
     from framework.crossing_field import ban_bandpass_gaussian, exclude_boundary, visualize_crossings, find_orientation_crossings
 
-    from framework.blockattribute import find_orientation, find_orientation_support_v
+    from framework.blockattribute import find_orientation, find_orientation_support_v, find_frequency
 
     from framework.grouping_framework import map_clustering_peak_threshold
 
@@ -433,7 +487,8 @@ if __name__ == "__main__":
 
     # out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
     out_path = r"C:\work\image_processing\latent_fingerprint\model\data\TV_img"
-    save_dir = r"C:\work\image_processing\latent_fingerprint\model\data\output"
+    # save_dir = r"C:\work\image_processing\latent_fingerprint\model\data\output"
+    out_path = r"D:\work\image_processing\Latent_fingerprint\SFP_latent_fingerprint_enh\segmentation\Latent_fingerprint_segmentation_KSIP2026\data\sd302h_original_500ppi"
     for file in tqdm(glob(os.path.join(out_path, '*'))):
         # file = r"C:\work\image_processing\latent_fingerprint\model\data\data_tv\overlap_rim.png"
         # if os.path.exists(os.path.join(save_dir, os.path.basename(file))):
@@ -503,29 +558,45 @@ if __name__ == "__main__":
         activation_map = mp_grp.generate_activation_map(pmv_map.shape[0], pmv_map.shape[1])
         activation_map = exclude_boundary(activation_map)
         activation_map = activation_map*pmv_mask        
-        # plot_all([pad_img, pmv_map, activation_map], cmap=['gray', 'hot', 'gray'], title_list=["Original", "PMV Map", "Starting Peak Pos"])
+        plot_all([pad_img, pmv_map, pmv_mask], cmap=['gray', 'hot', 'gray'], title_list=["Original", "PMV Map", "Starting Peak Pos"])
         
-        # ---- Create Attribute map ----
+        # ---- Create max pos Orientation map ----
         orientation_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.ndarray)
         orientation_map = BBF.apply_func_map(magnitude, find_orientation, output_is_img=False, output_vector=orientation_map)
         # ---- ---- ----
+        # ---- Create max pos Frequency map ----
+        freq_map = np.empty((len(row_map_index), len(col_map_index)), dtype=np.float32)
+        freq_map = BBF.apply_func_map(magnitude, find_frequency, output_is_img=False, output_vector=freq_map)
+        freq_map[freq_map>15] = 0
+        
         plot_orientation_map(orientation_map, background_image=pad_img, overlap_block_size=64, non_overlap_block_size=16, overlay_alpha=0.3)
 
-        gx, gy, magnitude = sobel_ignore_none(orientation_map, keep_none=False)
-        plot_all([magnitude, gx, gy])
+        # # ---- Try doing sobel and laplacian
+        # gx, gy, magnitude = sobel_ignore_none(orientation_map, keep_none=False)
+        # lap = laplacian_ignore_none(orientation_map)
+        # plot_all([pad_img, lap, magnitude, freq_map])
+        # # ---- ---- ----
+
+        # # 1. Run your original function (unmodified)
+        raw_crossings = find_orientation_crossings(orientation_map, d=3.0, dist_tol=1, cluster_tol=1, min_lines=60, max_crossings=10000, inside_image_only=True, activation_map=pmv_mask)
+        avg = 0
+        crossings = []
+        for crossing in raw_crossings:
+            cy, cx = crossing[0] # Continuous float coordinates
+            icy, icx = int(round(cy)), int(round(cx))
+            if 0 <= icy < pmv_mask.shape[0] and 0 <= icx < pmv_mask.shape[1]:
+                if pmv_mask[icy, icx]: # Only keep if inside mask
+                    crossings.append(crossing)
+                    avg += len(crossing)-1
+        total = len(crossings)
+        if total == 0:
+            avg = 0
+        else:
+            avg = avg/len(crossings)
+        print(f"Total Number of Crossing under current criterion are :{total}")
+        print(f"The average number of lines is {avg}")
         
-        # # # 1. Run your original function (unmodified)
-        # raw_crossings = find_orientation_crossings(orientation_map, d=2.0, dist_tol=1.5, cluster_tol=3.0, min_lines=2, max_crossings=100, inside_image_only=True, activation_map=activation_map)
-        # crossings = []
-        # for crossing in raw_crossings:
-        #     cy, cx = crossing[0] # Continuous float coordinates
-        #     icy, icx = int(round(cy)), int(round(cx))
-        #     if 0 <= icy < pmv_mask.shape[0] and 0 <= icx < pmv_mask.shape[1]:
-        #         if pmv_mask[icy, icx]: # Only keep if inside mask
-        #             crossings.append(crossing)
-
-
-        # visualize_crossings(orientation_map, crossings, background_image=pad_img, cmap='gray')
+        visualize_crossings(orientation_map, crossings, background_image=pad_img, cmap='gray')
         
         # r_idx, c_idx = 14, 14
         # r_idx, c_idx = 2, 0
